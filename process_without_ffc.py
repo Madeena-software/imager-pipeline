@@ -52,7 +52,7 @@ def process_single_image_no_ffc(
 
     Args:
         input_path: Path to input image
-        output_path: Path to save processed image
+        output_path: Path to save processed image (can be directory or full filepath)
         detector_type: 'BED' or 'TRX' (if None, auto-detect from filename)
         save_debug: Whether to save debug histograms
 
@@ -60,6 +60,12 @@ def process_single_image_no_ffc(
         True if successful, False otherwise
     """
     print(f"\nProcessing: {os.path.basename(input_path)}")
+
+    # If output_path is a directory, construct filename from input
+    if os.path.isdir(output_path) or not os.path.splitext(output_path)[1]:
+        # output_path is a directory, append input filename with same extension
+        input_filename = os.path.basename(input_path)
+        output_path = os.path.join(output_path, input_filename)
 
     # Detect detector type if not provided
     if detector_type is None:
@@ -293,6 +299,12 @@ def batch_process_folder(
         image_files.extend(input_path.glob(f"*{ext}"))
         image_files.extend(input_path.glob(f"*{ext.upper()}"))
 
+    # Deduplicate files (in case same file exists with different cases or extensions)
+    image_files = list(set(image_files))
+
+    # Exclude already processed files (those with '_processed' in the name)
+    image_files = [f for f in image_files if "_processed" not in f.stem]
+
     if not image_files:
         print(f"✗ No image files found in {input_folder}")
         print(f"  Looking for extensions: {extensions}")
@@ -360,13 +372,13 @@ def main():
     # ========================================================================
 
     # Processing mode: "single" or "folder"
-    MODE = "single"
+    MODE = "folder"
 
     # Input path (file path for single mode, folder path for folder mode)
-    INPUT_PATH = r"test\BED_1765259553954_rad.tiff"
+    INPUT_PATH = r"C:\Users\adlan\Desktop\ngoding\madeena-data\beton\Radiogaf 170 Kv dan 5 mA (21092023)\Koreksi 1.81818 Sampel ke 6 gain 6 (test 3)b"
 
     # Output path (file path for single mode, folder path for folder mode)
-    OUTPUT_PATH = r"test\output\processed.tiff"
+    OUTPUT_PATH = r"C:\Users\adlan\Desktop\ngoding\madeena-data\beton\Radiogaf 170 Kv dan 5 mA (21092023)\Koreksi 1.81818 Sampel ke 6 gain 6 (test 3)b\processing"
 
     # Optional: Detector type ("BED", "TRX", or None for auto-detect)
     DETECTOR_TYPE = None
