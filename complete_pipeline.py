@@ -18,6 +18,7 @@ def load_env_config():
         "USE_CONTRAST_ENHANCEMENT": True,
         "USE_NORMALIZE": False,
         "USE_INVERT": True,
+        "USE_FINAL_DENOISE": False,
         # Threshold method
         "THRESHOLD_METHOD": "auto",
         # Wavelet parameters
@@ -74,6 +75,7 @@ def load_env_config():
                         "USE_CONTRAST_ENHANCEMENT",
                         "USE_NORMALIZE",
                         "USE_INVERT",
+                        "USE_FINAL_DENOISE",
                         "CONTRAST_NORMALIZE",
                         "CONTRAST_EQUALIZE",
                         "CONTRAST_CLASSIC_EQUALIZATION",
@@ -805,7 +807,7 @@ def process_single_image(
         print(f"  Detected detector: {detector_type}")
 
     # Load images
-    print("  [1/9] Loading images...")
+    print("  [1/10] Loading images...")
     raw_image = cv2.imread(raw_path, cv2.IMREAD_UNCHANGED)
     dark_image = cv2.imread(dark_path, cv2.IMREAD_UNCHANGED)
     flat_image = cv2.imread(flat_path, cv2.IMREAD_UNCHANGED)
@@ -831,7 +833,7 @@ def process_single_image(
     flat_image = flat_image.astype(np.float32) / MAX_16BIT
 
     # Step 1: Crop and rotate images - ALL images must be transformed identically
-    print(f"  [2/9] Cropping and rotating ({detector_type})...")
+    print(f"  [2/10] Cropping and rotating ({detector_type})...")
 
     # Apply same transformation to all three images
     dark_cropped = crop_and_rotate_by_detector(dark_image, detector_type)
@@ -858,7 +860,7 @@ def process_single_image(
     wavelet_method = CONFIG["WAVELET_METHOD"]
     wavelet_mode = CONFIG["WAVELET_MODE"]
     print(
-        f"  [3/9] Denoising images (wavelet: {wavelet_type}, level={wavelet_level}, {wavelet_method}, {wavelet_mode})..."
+        f"  [3/10] Denoising images (wavelet: {wavelet_type}, level={wavelet_level}, {wavelet_method}, {wavelet_mode})..."
     )
     dark_denoised = denoise_wavelet(
         dark_cropped,
@@ -889,7 +891,7 @@ def process_single_image(
     )
 
     # Step 3: FFC with matched dimensions
-    print("  [4/9] Applying Flat-Field Correction...")
+    print("  [4/10] Applying Flat-Field Correction...")
     ffc_result = flat_field_correction(raw_denoised, dark_denoised, flat_denoised)
     print(f"    FFC output range: {ffc_result.min()} - {ffc_result.max()}")
 
@@ -901,7 +903,7 @@ def process_single_image(
 
     # Step 4: Normalize to configurable bit depth (optional)
     if CONFIG.get("USE_NORMALIZE", False):
-        print(f"  [5/9] Normalizing to max value {MAX_16BIT}...")
+        print(f"  [5/10] Normalizing to max value {MAX_16BIT}...")
         normalized_result = normalize_to_max_value(ffc_result, MAX_16BIT)
         print(
             f"    Normalized range: {normalized_result.min()} - {normalized_result.max()}"
@@ -913,7 +915,7 @@ def process_single_image(
             title=f"Normalized Result Histogram (max={MAX_16BIT})",
         )
     else:
-        print("  [5/9] Normalization skipped (USE_NORMALIZE=False)")
+        print("  [5/10] Normalization skipped (USE_NORMALIZE=False)")
         normalized_result = ffc_result.copy()
         if get_debug_flag():
             print(
@@ -923,14 +925,14 @@ def process_single_image(
     # Step 5: Auto Thresholding (optional)
     threshold_method = CONFIG.get("THRESHOLD_METHOD", "auto").lower()
     if threshold_method in ["none", "off", "skip", "no"]:
-        print("  [6/9] Thresholding skipped (THRESHOLD_METHOD set to 'none'/'off')")
+        print("  [6/10] Thresholding skipped (THRESHOLD_METHOD set to 'none'/'off')")
         threshold_result = normalized_result.copy()
         if get_debug_flag():
             print(
                 "    [DEBUG] Thresholding step was skipped. Passing normalized result forward."
             )
     else:
-        print("  [6/9] Auto Thresholding...")
+        print("  [6/10] Auto Thresholding...")
         threshold = auto_threshold_detection(
             normalized_result, filename=image_id, output_dir=debug_dir
         )
@@ -958,7 +960,7 @@ def process_single_image(
         )
 
     # Step 6: Invert
-    print("  [7/9] Inverting image...")
+    print("  [7/10] Inverting image...")
     inverted = invert_image(threshold_result)
 
     save_histogram(
@@ -968,7 +970,7 @@ def process_single_image(
     )
 
     # Step 7: Enhance Contrast using ImageJ Replicator
-    print("  [8/9] Enhancing contrast (ImageJ method)")
+    print("  [8/10] Enhancing contrast (ImageJ method)")
     if not CONFIG["USE_CONTRAST_ENHANCEMENT"]:
         print("    Skipping contrast enhancement (USE_CONTRAST_ENHANCEMENT=False)")
         enhanced_uint16 = (inverted * MAX_16BIT).clip(0, MAX_16BIT).astype(np.uint16)
@@ -1015,7 +1017,7 @@ def process_single_image(
     #   max_slope: 1.0-2.0 = kontras ringan (untuk X-ray medis)
     #              3.0     = default ImageJ
     #              4.0+    = kontras kuat
-    print("  [9/9] Applying CLAHE")
+    print("  [9/10] Applying CLAHE")
     if not CONFIG["USE_CLAHE"]:
         print("    Skipping CLAHE (USE_CLAHE=False)")
         final_result_uint16 = enhanced_uint16
@@ -1049,8 +1051,42 @@ def process_single_image(
     save_histogram(
         final_result_uint16,
         os.path.join(debug_dir, f"histogram_clahe_{image_id}.png"),
-        title="Final CLAHE Result Histogram",
+        title="CLAHE Result Histogram",
     )
+
+    # Step 10: Final wavelet denoise (optional, smooths out any artifacts from previous steps)
+    if CONFIG.get("USE_FINAL_DENOISE", False):
+        wavelet_type = CONFIG["WAVELET_TYPE"]
+        wavelet_level = CONFIG["WAVELET_LEVEL"]
+        wavelet_method = CONFIG["WAVELET_METHOD"]
+        wavelet_mode = CONFIG["WAVELET_MODE"]
+        print(
+            f"  [10/10] Final denoise (wavelet: {wavelet_type}, level={wavelet_level}, {wavelet_method}, {wavelet_mode})..."
+        )
+        # Convert uint16 to float32 for wavelet denoising
+        final_float = final_result_uint16.astype(np.float32) / MAX_16BIT
+        final_denoised = denoise_wavelet(
+            final_float,
+            wavelet=wavelet_type,
+            level=wavelet_level,
+            method=wavelet_method,
+            mode=wavelet_mode,
+        )
+        # Convert back to uint16
+        final_result_uint16 = (
+            (final_denoised * MAX_16BIT).clip(0, MAX_16BIT).astype(np.uint16)
+        )
+        print(
+            f"    Final denoised range: {final_result_uint16.min()} - {final_result_uint16.max()}"
+        )
+
+        save_histogram(
+            final_result_uint16,
+            os.path.join(debug_dir, f"histogram_final_denoised_{image_id}.png"),
+            title="Final Denoised Result Histogram",
+        )
+    else:
+        print("  [10/10] Final denoise skipped (USE_FINAL_DENOISE=False)")
 
     # Save result
     os.makedirs(os.path.dirname(output_path), exist_ok=True)

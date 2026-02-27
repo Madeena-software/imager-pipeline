@@ -4,6 +4,9 @@ Replicator untuk fungsi pemrosesan citra ImageJ di Python.
 Termasuk implementasi:
 - ContrastEnhancer (Enhance Contrast)
 - CLAHE (Contrast Limited Adaptive Histogram Equalization)
+- Hybrid 2D Median Filter (3x3, 5x5, 7x7)
+- Fast Temporal Median Filter (running median subtraction untuk stack)
+- Median Filter (circular kernel, Process > Filters > Median...)
 
 CLAHE Implementation Reference:
     Zuiderveld, Karel. "Contrast limited adaptive histogram equalization."
@@ -16,7 +19,7 @@ import cv2
 import numpy as np
 import math
 from typing import Optional, Tuple, Union
-from scipy.ndimage import gaussian_filter1d
+from scipy.ndimage import gaussian_filter1d, median_filter
 from concurrent.futures import ThreadPoolExecutor
 import warnings
 
@@ -702,3 +705,470 @@ class ImageJReplicator:
         result = np.clip(result, 0, max_val).astype(original_dtype)
 
         return result
+
+    # ---------------------------------------------------------
+    # Hybrid 2D Median Filter
+    # ---------------------------------------------------------
+
+    @staticmethod
+    def hybrid_median_filter_2d(
+        image: np.ndarray,
+        kernel_size: int = 3,
+        repetitions: int = 1,
+    ) -> np.ndarray:
+        """
+        Mereplikasi plugin Hybrid 2D Median Filter dari ImageJ.
+
+        Implementasi referensi: Hybrid_2D_Median_Filter.java
+        oleh Christopher Philip Mauer (cpmauer@northwestern.edu).
+
+        Filter hybrid median menghitung:
+        1. Median dari piksel kernel berbentuk Plus (+)
+        2. Median dari piksel kernel berbentuk X
+        3. Kemudian mengambil median dari [median_plus, median_x, piksel_pusat]
+
+        Kernel Plus (+) mengambil piksel sepanjang arah kardinal (atas, bawah,
+        kiri, kanan) dari piksel pusat, sedangkan kernel X mengambil piksel
+        sepanjang arah diagonal. Pendekatan hybrid ini memberikan smoothing
+        yang mempertahankan tepi (edge-preserving) lebih baik dibanding
+        filter median standar.
+
+        Boundary handling menggunakan 'edge' mode (replicate) yang mereplikasi
+        perilaku fallback cascading dari implementasi Java asli, di mana piksel
+        di luar batas diganti dengan piksel terdekat pada arah yang sama.
+
+        Args:
+            image: Citra input grayscale (uint8 atau uint16).
+                Untuk citra RGB/multi-channel, setiap channel diproses terpisah.
+            kernel_size: Ukuran kernel - 3, 5, atau 7 (default: 3).
+                Sesuai opsi "3x3", "5x5", "7x7" di dialog ImageJ.
+            repetitions: Jumlah pengulangan filter (default: 1).
+                Sesuai "Number of Repetitions" di dialog ImageJ.
+
+        Returns:
+            np.ndarray: Citra terfilter dengan dtype yang sama dengan input.
+
+        Raises:
+            ValueError: Jika kernel_size bukan 3, 5, atau 7, atau input kosong.
+            TypeError: Jika tipe data input tidak sesuai.
+
+        Example:
+            >>> filtered = ImageJReplicator.hybrid_median_filter_2d(
+            ...     image, kernel_size=5, repetitions=2
+            ... )
+        """
+        # Validasi input
+        if image is None:
+            raise ValueError("Citra input tidak boleh kosong")
+        if not isinstance(image, np.ndarray):
+            raise TypeError("Input harus berupa numpy array")
+        if image.size == 0:
+            raise ValueError("Array citra tidak boleh kosong")
+        if kernel_size not in (3, 5, 7):
+            raise ValueError(
+                "kernel_size harus 3, 5, atau 7 "
+                "(sesuai opsi '3x3', '5x5', '7x7' di ImageJ)"
+            )
+        if repetitions < 1:
+            warnings.warn(
+                "Nilai repetitions tidak valid. "
+                "Harus >= 1. Menggunakan 1 pengulangan.",
+                stacklevel=2,
+            )
+            repetitions = 1
+
+        original_dtype = image.dtype
+        radius = kernel_size // 2  # 1, 2, atau 3
+
+        # Handle citra multi-channel (RGB dsb.)
+        if len(image.shape) == 3:
+            channels = cv2.split(image)
+            processed = [
+                ImageJReplicator.hybrid_median_filter_2d(ch, kernel_size, repetitions)
+                for ch in channels
+            ]
+            return cv2.merge(processed)
+
+        # Kerja dengan float64 untuk presisi (mereplikasi double[] di Java)
+        result = image.astype(np.float64)
+        height, width = result.shape
+
+        # Definisi offset kernel Plus (+): piksel pada arah kardinal
+        # 3x3: 5 piksel, 5x5: 9 piksel, 7x7: 13 piksel
+        #
+        # Contoh 5x5 Plus:
+        #   . . X . .
+        #   . . X . .
+        #   X X * X X
+        #   . . X . .
+        #   . . X . .
+        plus_offsets = [(0, 0)]  # pusat
+        for r in range(1, radius + 1):
+            plus_offsets.extend([(-r, 0), (r, 0), (0, -r), (0, r)])
+
+        # Definisi offset kernel X: piksel pada arah diagonal
+        # 3x3: 5 piksel, 5x5: 9 piksel, 7x7: 13 piksel
+        #
+        # Contoh 5x5 X:
+        #   X . . . X
+        #   . X . X .
+        #   . . * . .
+        #   . X . X .
+        #   X . . . X
+        x_offsets = [(0, 0)]  # pusat
+        for r in range(1, radius + 1):
+            x_offsets.extend([(-r, -r), (-r, r), (r, -r), (r, r)])
+
+        n_plus = len(plus_offsets)
+        n_x = len(x_offsets)
+
+        for _ in range(repetitions):
+            # Pad citra dengan 'edge' mode (replicate boundary pixels)
+            # Mereplikasi perilaku fallback try/catch cascading di Java:
+            #   try { pixel[j-2*m] } catch { try { pixel[j-m] } catch { pixel[j] } }
+            # yang secara efektif mengganti piksel OOB dengan piksel terdekat di tepi.
+            padded = np.pad(result, radius, mode="edge")
+
+            # Ekstrak nilai kernel Plus secara vectorized
+            plus_values = np.empty((n_plus, height, width), dtype=np.float64)
+            for i, (dr, dc) in enumerate(plus_offsets):
+                plus_values[i] = padded[
+                    radius + dr : radius + dr + height,
+                    radius + dc : radius + dc + width,
+                ]
+
+            # Ekstrak nilai kernel X secara vectorized
+            x_values = np.empty((n_x, height, width), dtype=np.float64)
+            for i, (dr, dc) in enumerate(x_offsets):
+                x_values[i] = padded[
+                    radius + dr : radius + dr + height,
+                    radius + dc : radius + dc + width,
+                ]
+
+            # Hitung median Plus dan median X
+            median_plus = np.median(plus_values, axis=0)
+            median_x = np.median(x_values, axis=0)
+            center = result.copy()
+
+            # Median dari tiga nilai: median(median_plus, median_x, center)
+            # Optimasi: median(a,b,c) = max(min(a,b), min(max(a,b), c))
+            # Lebih cepat daripada np.median untuk tepat 3 nilai.
+            result = np.maximum(
+                np.minimum(median_plus, median_x),
+                np.minimum(np.maximum(median_plus, median_x), center),
+            )
+
+        # Konversi kembali ke dtype asli
+        if np.issubdtype(original_dtype, np.integer):
+            info = np.iinfo(original_dtype)
+            return np.clip(result, info.min, info.max).astype(original_dtype)
+        return result.astype(original_dtype)
+
+    # ---------------------------------------------------------
+    # Fast Temporal Median Filter
+    # ---------------------------------------------------------
+
+    @staticmethod
+    def fast_temporal_median(
+        stack: np.ndarray,
+        start_frame: int = 1,
+        end_frame: Optional[int] = None,
+        window_size: int = 27,
+        intensity_normalization: bool = False,
+    ) -> np.ndarray:
+        """
+        Mereplikasi plugin Fast Temporal Median dari ImageJ.
+
+        Implementasi referensi: Fast_Temporal_Median.java
+        oleh Marcelo Augusto Cordeiro, Milstein Lab, University of Toronto.
+
+        Algoritma ini menghitung running temporal median pada setiap posisi
+        piksel sepanjang dimensi waktu (frame) dari image stack, kemudian
+        mengurangi median tersebut dari frame asli. Berguna untuk menghilangkan
+        latar belakang statis/slowly-varying pada data time-lapse microscopy.
+
+        Plugin menggunakan Forward Window: untuk frame ke-k, jendela median
+        diambil dari frame [k] sampai [k + window_size - 1].
+
+        Jika intensity_normalization diaktifkan, nilai piksel dinormalisasi
+        terhadap rata-rata intensitas frame sebelum menghitung median, lalu
+        di-denormalisasi saat pengurangan. Ini mengkompensasi fluktuasi
+        intensitas global (misalnya photobleaching).
+
+        Args:
+            stack: Image stack 3D (frames, height, width), uint8 atau uint16.
+            start_frame: Frame awal (1-based, default: 1).
+                Sesuai "Start Frame" di dialog ImageJ.
+            end_frame: Frame akhir (1-based, inklusif, default: jumlah frame).
+                Sesuai "End Frame" di dialog ImageJ.
+            window_size: Ukuran jendela temporal (default: 27).
+                Sesuai "Window Size" di dialog ImageJ. Harus >= 2.
+            intensity_normalization: Jika True, normalisasi intensitas
+                digunakan (default: False). Sesuai "Intensity Normalization"
+                di dialog ImageJ.
+
+        Returns:
+            np.ndarray: Stack hasil filter dengan median temporal dikurangi.
+                Shape: (n_output_frames, height, width).
+                Jumlah frame output = end_frame - window_size - start_frame + 1.
+                Tipe data sama dengan input.
+
+        Raises:
+            ValueError: Jika dimensi atau parameter tidak valid.
+            TypeError: Jika tipe data input tidak sesuai.
+
+        Note:
+            Implementasi Java asli menggunakan varian algoritma Huang untuk
+            update histogram inkremental secara O(1) per piksel per frame.
+            Implementasi Python ini menggunakan ``np.partition`` (introselect,
+            O(n) per jendela) yang memberikan hasil identik dengan performa
+            yang baik berkat vektorisasi NumPy.
+
+            Median yang digunakan adalah *true median*: elemen ke-
+            ``(window_size - 1) // 2`` (0-based) dari jendela terurut.
+            Ini sedikit berbeda dari implementasi Java yang mengambil elemen
+            ke- ``window_size // 2 - 1`` (off-by-one), namun secara statistik
+            lebih benar. Untuk window_size >= 20 (tipikal), perbedaannya
+            kurang dari 1 intensity level.
+
+        Example:
+            >>> result = ImageJReplicator.fast_temporal_median(
+            ...     stack, window_size=27, intensity_normalization=False
+            ... )
+        """
+        # Validasi input
+        if stack is None:
+            raise ValueError("Stack input tidak boleh kosong")
+        if not isinstance(stack, np.ndarray):
+            raise TypeError("Input harus berupa numpy array")
+        if stack.ndim != 3:
+            raise ValueError(
+                "Stack harus berupa 3D array dengan shape (frames, height, width)"
+            )
+        if stack.size == 0:
+            raise ValueError("Array stack tidak boleh kosong")
+
+        original_dtype = stack.dtype
+        n_frames, height, width = stack.shape
+
+        if end_frame is None:
+            end_frame = n_frames
+
+        # Validasi parameter (sesuai dialog Java)
+        if window_size < 2 or window_size > n_frames:
+            raise ValueError(
+                f"window_size harus antara 2 dan {n_frames}, "
+                f"diberikan: {window_size}"
+            )
+        if start_frame < 1 or start_frame > (n_frames - window_size + 1):
+            raise ValueError(
+                f"start_frame harus antara 1 dan {n_frames - window_size + 1}, "
+                f"diberikan: {start_frame}"
+            )
+        if end_frame > n_frames or end_frame < window_size:
+            raise ValueError(
+                f"end_frame harus antara {window_size} dan {n_frames}, "
+                f"diberikan: {end_frame}"
+            )
+
+        # Jumlah frame output
+        # Java: for k=start to (end-window), inclusive (1-based)
+        # Python 0-based: k dari start_frame-1 sampai end_frame-window_size-1
+        n_output = end_frame - window_size - start_frame + 1
+        if n_output <= 0:
+            raise ValueError(
+                "Tidak ada frame output yang dihasilkan. "
+                "Periksa kombinasi start_frame, end_frame, dan window_size."
+            )
+
+        result = np.empty((n_output, height, width), dtype=original_dtype)
+
+        # True median rank (0-based index dalam jendela terurut)
+        # Untuk window_size=27: rank=13 → elemen ke-14 (median sejati)
+        # Untuk window_size=28: rank=13 → lower-median dari dua tengah
+        median_rank = (window_size - 1) // 2
+
+        # Tentukan max value berdasarkan dtype
+        if np.issubdtype(original_dtype, np.integer):
+            max_val = np.iinfo(original_dtype).max
+        else:
+            max_val = np.finfo(original_dtype).max
+
+        if not intensity_normalization:
+            # ----------------------------------------------------------
+            # Mode tanpa normalisasi intensitas
+            # ----------------------------------------------------------
+            for idx, k in enumerate(
+                range(start_frame - 1, end_frame - window_size)
+            ):
+                # Ekstrak jendela temporal: frame k sampai k+window_size-1
+                window = stack[k : k + window_size]
+
+                # np.partition menempatkan elemen ke-median_rank pada posisi
+                # yang benar (partial sort, O(n)), lebih cepat dari full sort
+                partitioned = np.partition(window, median_rank, axis=0)
+                temporal_median = partitioned[median_rank].astype(np.float64)
+
+                # Kurangi median dari frame saat ini, clamp ke >= 0
+                frame = stack[k].astype(np.float64) - temporal_median
+                np.clip(frame, 0, max_val, out=frame)
+                result[idx] = frame.astype(original_dtype)
+        else:
+            # ----------------------------------------------------------
+            # Mode dengan normalisasi intensitas
+            # ----------------------------------------------------------
+            # Hitung rata-rata intensitas setiap frame yang digunakan
+            # Java: mean[i-1] = sum(pixels) / dimension untuk frame i
+            frame_means = np.mean(
+                stack[start_frame - 1 : end_frame].astype(np.float64),
+                axis=(1, 2),
+            )
+
+            for idx, k in enumerate(
+                range(start_frame - 1, end_frame - window_size)
+            ):
+                window = stack[k : k + window_size].astype(np.float64)
+
+                # Indeks ke dalam frame_means: offset dari start_frame-1
+                means_offset = k - (start_frame - 1)
+                w_means = frame_means[
+                    means_offset : means_offset + window_size
+                ]
+
+                # Hindari pembagian dengan nol
+                safe_means = np.where(w_means > 0, w_means, 1.0)
+
+                # Normalisasi: value_norm = int(pixel / mean_frame * 1000)
+                # Mereplikasi: (int)(((float)pixels[j]/(float)mean[...])*1000)
+                normalized = (
+                    window
+                    / safe_means[:, np.newaxis, np.newaxis]
+                    * 1000.0
+                ).astype(np.int32)
+
+                # Hitung median dari nilai ternormalisasi
+                partitioned = np.partition(
+                    normalized, median_rank, axis=0
+                )
+                norm_median = partitioned[median_rank].astype(np.float64)
+
+                # De-normalisasi median dan kurangi dari frame asli
+                # Java: pixels[j] -= (median[j] * ((float)mean[k-1]/(float)1000))
+                current_mean = frame_means[means_offset]
+                denorm_median = norm_median * (current_mean / 1000.0)
+
+                frame = stack[k].astype(np.float64) - denorm_median
+                np.clip(frame, 0, max_val, out=frame)
+                result[idx] = frame.astype(original_dtype)
+
+        return result
+
+    # ---------------------------------------------------------
+    # Median Filter (Process > Filters > Median...)
+    # ---------------------------------------------------------
+
+    @staticmethod
+    def _make_circular_kernel_imagej(radius: float) -> np.ndarray:
+        """
+        Buat kernel lingkaran sesuai algoritma ImageJ RankFilters.java.
+
+        ImageJ menghitung batas lingkaran menggunakan:
+            r2 = int(radius * radius) + 1
+            kRadius = int(sqrt(r2))
+            Untuk setiap baris y: dx = int(sqrt(r2 - y*y))
+
+        Ini memberikan bentuk lingkaran diskrit yang sedikit lebih besar
+        dari lingkaran sempurna berradius 'radius', karena penambahan +1
+        pada r2.
+
+        Args:
+            radius: Radius dalam piksel (bisa float, misal 5.0).
+
+        Returns:
+            np.ndarray: Boolean 2D array sebagai footprint kernel.
+        """
+        r2 = int(radius * radius) + 1
+        k_radius = int(math.sqrt(r2 + 1e-10))
+        size = 2 * k_radius + 1
+        kernel = np.zeros((size, size), dtype=bool)
+
+        for y in range(-k_radius, k_radius + 1):
+            dx = int(math.sqrt(r2 - y * y + 1e-10))
+            for x in range(-dx, dx + 1):
+                kernel[y + k_radius, x + k_radius] = True
+
+        return kernel
+
+    @staticmethod
+    def median_filter_imagej(
+        image: np.ndarray,
+        radius: float = 5.0,
+    ) -> np.ndarray:
+        """
+        Mereplikasi filter Median dari ImageJ (Process > Filters > Median...).
+
+        Implementasi referensi: RankFilters.java dari ImageJ.
+
+        Filter median standar ImageJ menggunakan kernel berbentuk lingkaran
+        (circular disk) yang didefinisikan oleh radius dalam piksel. Untuk
+        setiap piksel, semua piksel tetangga di dalam lingkaran dikumpulkan,
+        dan nilai median menggantikan piksel pusat.
+
+        Berbeda dari `cv2.medianBlur` yang menggunakan kernel persegi,
+        implementasi ini menggunakan kernel lingkaran yang identik dengan
+        ImageJ, memberikan hasil yang cocok dengan output ImageJ.
+
+        Boundary handling menggunakan mode 'nearest' (duplikat piksel tepi),
+        mereplikasi PADDING_DUPLICATE dari RankFilters.java.
+
+        Args:
+            image: Citra input grayscale (uint8 atau uint16).
+                Untuk citra RGB/multi-channel, setiap channel diproses
+                terpisah.
+            radius: Radius kernel dalam piksel (default: 5.0).
+                Sesuai field "Radius" di dialog ImageJ Median.
+                Nilai float diperbolehkan (misal 2.5, 5.0).
+
+        Returns:
+            np.ndarray: Citra terfilter dengan dtype yang sama dengan input.
+
+        Raises:
+            ValueError: Jika radius <= 0 atau input tidak valid.
+            TypeError: Jika tipe data input tidak sesuai.
+
+        Example:
+            >>> filtered = ImageJReplicator.median_filter_imagej(
+            ...     image, radius=5.0
+            ... )
+        """
+        # Validasi input
+        if image is None:
+            raise ValueError("Citra input tidak boleh kosong")
+        if not isinstance(image, np.ndarray):
+            raise TypeError("Input harus berupa numpy array")
+        if image.size == 0:
+            raise ValueError("Array citra tidak boleh kosong")
+        if radius <= 0:
+            raise ValueError(f"Radius harus > 0, diberikan: {radius}")
+
+        original_dtype = image.dtype
+
+        # Handle citra multi-channel (RGB dsb.)
+        if len(image.shape) == 3:
+            channels = cv2.split(image)
+            processed = [
+                ImageJReplicator.median_filter_imagej(ch, radius)
+                for ch in channels
+            ]
+            return cv2.merge(processed)
+
+        # Buat kernel lingkaran sesuai ImageJ
+        footprint = ImageJReplicator._make_circular_kernel_imagej(radius)
+
+        # Terapkan median filter dengan kernel lingkaran
+        # mode='nearest' mereplikasi PADDING_DUPLICATE dari ImageJ
+        result = median_filter(
+            image, footprint=footprint, mode='nearest'
+        )
+
+        return result.astype(original_dtype)
