@@ -143,8 +143,8 @@ def save_histogram(image, out_path, title=None):
 Complete X-ray Image Processing Pipeline with GPU Acceleration
 
 Processing steps:
-1. Denoise dark, gain, raw using wavelet (sym4, level=3, BayesShrink, soft)
-2. Crop and rotate by detector type (BED/TRX)
+1. Crop and rotate by detector type (BED/TRX)
+2. Denoise dark, gain, raw using wavelet (sym4, level=3, BayesShrink, soft)
 3. Calculate FFC with GPU acceleration
 4. Normalize to 16-bit range (scale max value to 65535)
 5. Auto Thresholding (background separation)
@@ -779,8 +779,8 @@ def process_single_image(
     Process a single image through the complete pipeline.
 
     Pipeline:
-    1. Denoise dark, gain, raw using wavelet
-    2. Crop and rotate all images (dark, gain, raw) by detector type
+    1. Crop and rotate all images (dark, gain, raw) by detector type
+    2. Denoise dark, gain, raw using wavelet
     3. Calculate FFC
     4. Auto Thresholding
     5. Invert
@@ -830,30 +830,52 @@ def process_single_image(
     dark_image = dark_image.astype(np.float32) / MAX_16BIT
     flat_image = flat_image.astype(np.float32) / MAX_16BIT
 
-    # Step 1: Denoise using wavelet (now works with float32 [0,1])
+    # Step 1: Crop and rotate images - ALL images must be transformed identically
+    print(f"  [2/9] Cropping and rotating ({detector_type})...")
+
+    # Apply same transformation to all three images
+    dark_cropped = crop_and_rotate_by_detector(dark_image, detector_type)
+    flat_cropped = crop_and_rotate_by_detector(flat_image, detector_type)
+    raw_cropped = crop_and_rotate_by_detector(raw_image, detector_type)
+
+    crop_info = f"top={CONFIG['CROP_TOP']}, bottom={CONFIG['CROP_BOTTOM']}, left={CONFIG['CROP_LEFT']}, right={CONFIG['CROP_RIGHT']}"
+    if detector_type == "TRX":
+        print(f"    All images: cropped ({crop_info}), rotated 90° CCW")
+    else:
+        print(f"    All images: cropped ({crop_info})")
+
+    print(f"    Final shape (all identical): {raw_cropped.shape}")
+
+    save_histogram(
+        raw_cropped,
+        os.path.join(debug_dir, f"histogram_cropped_{image_id}.png"),
+        title="Cropped Raw Histogram",
+    )
+
+    # Step 2: Denoise using wavelet (now works with float32 [0,1])
     wavelet_type = CONFIG["WAVELET_TYPE"]
     wavelet_level = CONFIG["WAVELET_LEVEL"]
     wavelet_method = CONFIG["WAVELET_METHOD"]
     wavelet_mode = CONFIG["WAVELET_MODE"]
     print(
-        f"  [2/9] Denoising images (wavelet: {wavelet_type}, level={wavelet_level}, {wavelet_method}, {wavelet_mode})..."
+        f"  [3/9] Denoising images (wavelet: {wavelet_type}, level={wavelet_level}, {wavelet_method}, {wavelet_mode})..."
     )
     dark_denoised = denoise_wavelet(
-        dark_image,
+        dark_cropped,
         wavelet=wavelet_type,
         level=wavelet_level,
         method=wavelet_method,
         mode=wavelet_mode,
     )
     flat_denoised = denoise_wavelet(
-        flat_image,
+        flat_cropped,
         wavelet=wavelet_type,
         level=wavelet_level,
         method=wavelet_method,
         mode=wavelet_mode,
     )
     raw_denoised = denoise_wavelet(
-        raw_image,
+        raw_cropped,
         wavelet=wavelet_type,
         level=wavelet_level,
         method=wavelet_method,
@@ -866,31 +888,9 @@ def process_single_image(
         title="Denoised Raw Histogram",
     )
 
-    # Step 2: Crop and rotate images - ALL images must be transformed identically
-    print(f"  [3/9] Cropping and rotating ({detector_type})...")
-
-    # Apply same transformation to all three images
-    dark_cropped = crop_and_rotate_by_detector(dark_denoised, detector_type)
-    flat_cropped = crop_and_rotate_by_detector(flat_denoised, detector_type)
-    raw_cropped = crop_and_rotate_by_detector(raw_denoised, detector_type)
-
-    save_histogram(
-        raw_cropped,
-        os.path.join(debug_dir, f"histogram_cropped_{image_id}.png"),
-        title="Cropped Raw Histogram",
-    )
-
-    crop_info = f"top={CONFIG['CROP_TOP']}, bottom={CONFIG['CROP_BOTTOM']}, left={CONFIG['CROP_LEFT']}, right={CONFIG['CROP_RIGHT']}"
-    if detector_type == "TRX":
-        print(f"    All images: cropped ({crop_info}), rotated 90° CCW")
-    else:
-        print(f"    All images: cropped ({crop_info})")
-
-    print(f"    Final shape (all identical): {raw_cropped.shape}")
-
     # Step 3: FFC with matched dimensions
     print("  [4/9] Applying Flat-Field Correction...")
-    ffc_result = flat_field_correction(raw_cropped, dark_cropped, flat_cropped)
+    ffc_result = flat_field_correction(raw_denoised, dark_denoised, flat_denoised)
     print(f"    FFC output range: {ffc_result.min()} - {ffc_result.max()}")
 
     save_histogram(
@@ -1169,10 +1169,10 @@ def main():
     print("COMPLETE X-RAY IMAGE PROCESSING PIPELINE")
     print("=" * 70)
     print("\nProcessing steps:")
-    print("  1. Denoise (wavelet: sym4, level=3, BayesShrink, soft)")
-    print("  2. Crop & Rotate by detector type:")
+    print("  1. Crop & Rotate by detector type:")
     print("      - TRX: crop 200px each side, rotate 90° CCW")
     print("      - BED: crop 200px each side")
+    print("  2. Denoise (wavelet: sym4, level=3, BayesShrink, soft)")
     print("  3. Flat-Field Correction (FFC) with GPU acceleration")
     print("  4. Auto Thresholding (background separation)")
     print("  5. Invert")
