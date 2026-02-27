@@ -17,6 +17,7 @@ def load_env_config():
         "USE_CLAHE": True,
         "USE_CONTRAST_ENHANCEMENT": True,
         "USE_NORMALIZE": False,
+        "USE_EQUALIZE": False,
         "USE_INVERT": True,
         # Threshold method
         "THRESHOLD_METHOD": "auto",
@@ -73,6 +74,7 @@ def load_env_config():
                         "USE_CLAHE",
                         "USE_CONTRAST_ENHANCEMENT",
                         "USE_NORMALIZE",
+                        "USE_EQUALIZE",
                         "USE_INVERT",
                         "CONTRAST_NORMALIZE",
                         "CONTRAST_EQUALIZE",
@@ -145,8 +147,8 @@ Complete X-ray Image Processing Pipeline with GPU Acceleration
 Processing steps:
 1. Crop and rotate by detector type (BED/TRX)
 2. Denoise dark, gain, raw using wavelet (sym4, level=3, BayesShrink, soft)
-3. Calculate FFC with GPU acceleration
-4. Normalize to 16-bit range (scale max value to 65535)
+3. Equalize histogram of raw (optional, ImageJ method - helps valley detection)
+4. Calculate FFC with GPU acceleration
 5. Auto Thresholding (background separation)
 6. Invert
 7. Enhance Contrast like ImageJ (saturated pixels=10%, Normalize, Equalize histogram)
@@ -781,11 +783,12 @@ def process_single_image(
     Pipeline:
     1. Crop and rotate all images (dark, gain, raw) by detector type
     2. Denoise dark, gain, raw using wavelet
-    3. Calculate FFC
-    4. Auto Thresholding
-    5. Invert
-    6. Enhance Contrast (ImageJ method: saturated=0.35%, normalize)
-    7. CLAHE (ImageJ method: block_size=127, max_slope=1.5)
+    3. Equalize histogram of raw (optional, ImageJ method)
+    4. Calculate FFC
+    5. Auto Thresholding
+    6. Invert
+    7. Enhance Contrast (ImageJ method: saturated=0.35%, normalize)
+    8. CLAHE (ImageJ method: block_size=127, max_slope=1.5)
 
     Args:
         raw_path: Path to raw image
@@ -888,8 +891,57 @@ def process_single_image(
         title="Denoised Raw Histogram",
     )
 
-    # Step 3: FFC with matched dimensions
-    print("  [4/9] Applying Flat-Field Correction...")
+    # Step 3b: Equalize histogram of raw_denoised (optional, helps valley detection in auto threshold)
+    if CONFIG.get("USE_EQUALIZE", False) and IMAGEJ_AVAILABLE:
+        print("  [4/9] Equalizing histogram (ImageJ method)...")
+        # Convert float32 [0,1] to uint16 for ImageJ equalization
+        raw_uint16 = (raw_denoised * MAX_16BIT).clip(0, MAX_16BIT).astype(np.uint16)
+        raw_equalized = ImageJReplicator.enhance_contrast(
+            raw_uint16,
+            saturated_pixels=0.35,
+            equalize=True,
+            normalize=False,
+            classic_equalization=False,
+        )
+        # Convert back to float32 [0,1]
+        raw_denoised = raw_equalized.astype(np.float32) / MAX_16BIT
+        print(
+            f"    Equalized range: {raw_denoised.min():.6f} - {raw_denoised.max():.6f}"
+        )
+
+        save_histogram(
+            raw_denoised,
+            os.path.join(debug_dir, f"histogram_equalized_{image_id}.png"),
+            title="Equalized Raw Histogram",
+        )
+
+        # Re-denoise raw after equalization (equalize can amplify noise)
+        print(
+            f"    Re-denoising equalized raw (wavelet: {wavelet_type}, level={wavelet_level}, {wavelet_method}, {wavelet_mode})..."
+        )
+        raw_denoised = denoise_wavelet(
+            raw_denoised,
+            wavelet=wavelet_type,
+            level=wavelet_level,
+            method=wavelet_method,
+            mode=wavelet_mode,
+        )
+        print(
+            f"    Re-denoised range: {raw_denoised.min():.6f} - {raw_denoised.max():.6f}"
+        )
+
+        save_histogram(
+            raw_denoised,
+            os.path.join(debug_dir, f"histogram_equalized_denoised_{image_id}.png"),
+            title="Equalized + Re-denoised Raw Histogram",
+        )
+    elif CONFIG.get("USE_EQUALIZE", False) and not IMAGEJ_AVAILABLE:
+        print("  [4/9] Equalize skipped (ImageJ not available)")
+    else:
+        print("  [4/9] Equalize skipped (USE_EQUALIZE=False)")
+
+    # Step 4: FFC with matched dimensions
+    print("  [5/9] Applying Flat-Field Correction...")
     ffc_result = flat_field_correction(raw_denoised, dark_denoised, flat_denoised)
     print(f"    FFC output range: {ffc_result.min()} - {ffc_result.max()}")
 
@@ -899,50 +951,29 @@ def process_single_image(
         title="FFC Result Histogram (Normalized 0-1)",
     )
 
-    # Step 4: Normalize to configurable bit depth (optional)
-    if CONFIG.get("USE_NORMALIZE", False):
-        print(f"  [5/9] Normalizing to max value {MAX_16BIT}...")
-        normalized_result = normalize_to_max_value(ffc_result, MAX_16BIT)
-        print(
-            f"    Normalized range: {normalized_result.min()} - {normalized_result.max()}"
-        )
-
-        save_histogram(
-            normalized_result / MAX_16BIT,
-            os.path.join(debug_dir, f"histogram_normalized_{image_id}.png"),
-            title=f"Normalized Result Histogram (max={MAX_16BIT})",
-        )
-    else:
-        print("  [5/9] Normalization skipped (USE_NORMALIZE=False)")
-        normalized_result = ffc_result.copy()
-        if get_debug_flag():
-            print(
-                "    [DEBUG] Normalization step was skipped. Passing FFC result forward."
-            )
-
     # Step 5: Auto Thresholding (optional)
     threshold_method = CONFIG.get("THRESHOLD_METHOD", "auto").lower()
     if threshold_method in ["none", "off", "skip", "no"]:
         print("  [6/9] Thresholding skipped (THRESHOLD_METHOD set to 'none'/'off')")
-        threshold_result = normalized_result.copy()
+        threshold_result = ffc_result.copy()
         if get_debug_flag():
             print(
-                "    [DEBUG] Thresholding step was skipped. Passing normalized result forward."
+                "    [DEBUG] Thresholding step was skipped. Passing FFC result forward."
             )
     else:
         print("  [6/9] Auto Thresholding...")
         threshold = auto_threshold_detection(
-            normalized_result, filename=image_id, output_dir=debug_dir
+            ffc_result, filename=image_id, output_dir=debug_dir
         )
         if get_debug_flag():
             print(f"    [DEBUG] Detected threshold: {threshold:.6f}")
             # Debug: pixel counts below/above threshold
-            below = np.count_nonzero(normalized_result <= threshold)
-            above = np.count_nonzero(normalized_result > threshold)
-            total = normalized_result.size
+            below = np.count_nonzero(ffc_result <= threshold)
+            above = np.count_nonzero(ffc_result > threshold)
+            total = ffc_result.size
             print(f"    [DEBUG] Pixels <= threshold: {below} ({below/total:.2%})")
             print(f"    [DEBUG] Pixels > threshold: {above} ({above/total:.2%})")
-        threshold_result = apply_threshold_separation(normalized_result, threshold)
+        threshold_result = apply_threshold_separation(ffc_result, threshold)
         if get_debug_flag():
             print(
                 f"    [DEBUG] Thresholded min/max: {threshold_result.min()} - {threshold_result.max()}"
@@ -1173,11 +1204,12 @@ def main():
     print("      - TRX: crop 200px each side, rotate 90° CCW")
     print("      - BED: crop 200px each side")
     print("  2. Denoise (wavelet: sym4, level=3, BayesShrink, soft)")
-    print("  3. Flat-Field Correction (FFC) with GPU acceleration")
-    print("  4. Auto Thresholding (background separation)")
-    print("  5. Invert")
-    print("  6. Enhance Contrast (ImageJ method: saturated=0.35%, normalize=True)")
-    print("  7. CLAHE (ImageJ method: block_size=127, max_slope=1.5)")
+    print("  3. Equalize histogram (optional, ImageJ method)")
+    print("  4. Flat-Field Correction (FFC) with GPU acceleration")
+    print("  5. Auto Thresholding (background separation)")
+    print("  6. Invert")
+    print("  7. Enhance Contrast (ImageJ method: saturated=0.35%, normalize=True)")
+    print("  8. CLAHE (ImageJ method: block_size=127, max_slope=1.5)")
     print("\nOptimizations:")
     print("  - GPU acceleration for FFC and array operations (CuPy)")
     print("  - Parallel batch processing (multiprocessing)")
