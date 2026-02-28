@@ -20,7 +20,10 @@ import numpy as np
 import math
 from typing import Optional, Tuple, Union
 from scipy.ndimage import gaussian_filter1d, median_filter
-from concurrent.futures import ThreadPoolExecutor
+try:
+    from concurrent.futures import ThreadPoolExecutor
+except ImportError:
+    ThreadPoolExecutor = None
 import warnings
 
 # Konstanta bit depth

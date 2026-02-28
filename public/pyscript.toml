@@ -1,20 +1,30 @@
 # PyScript configuration for Image Pipeline Node Editor
 #
-# Packages are NOT listed here — they are installed via micropip
-# in app.py so the UI can show per-package loading progress.
+# All packages are listed here so PyScript/Pyodide installs them
+# automatically during boot (before app.py runs).
 #
 # Pipeline modules (.py files) live inside public/ alongside this config.
 # They are declared below so PyScript/Pyodide can import them.
 #
-# opencv-python is available as a Pyodide pre-built Wasm package.
-# It is installed via micropip in app.py (Pyodide resolves the Wasm wheel).
-#
 # Serve locally:
 #   python -m http.server 5500 --directory public
 #   Open http://127.0.0.1:5500
+
+experimental_create_proxy = "auto"
+
+packages = [
+  "numpy",
+  "Pillow",
+  "opencv-python",
+  "scipy",
+  "scikit-image",
+  "PyWavelets",
+  "matplotlib",
+]
 
 [files]
 "./complete_pipeline.py"  = "./complete_pipeline.py"
 "./wavelet_denoising.py"  = "./wavelet_denoising.py"
 "./imagej_replicator.py"  = "./imagej_replicator.py"
 "./camera_calibration.py" = "./camera_calibration.py"
+"./browser_processor.py"  = "./browser_processor.py"

@@ -14,7 +14,7 @@
     <div class="loading-content">
       <div class="spinner"></div>
       <h2>Loading Image Pipeline...</h2>
-      <p id="loading-status">Initializing PyScript runtime...</p>
+      <p id="loading-status">Initializing PyScript runtime & installing packages...</p>
     </div>
   </div>
 
@@ -26,11 +26,23 @@
     <div id="import-error-banner" class="error-banner" style="display: none;"></div>
 
     <section class="panel">
-      <h2>Konfigurasi</h2>
-      <div class="grid two">
+      <h2>Input Gambar</h2>
+      <p class="section-note">Upload 3 gambar untuk Flat-Field Correction (FFC): Dark, Gain (Flat), dan Raw. Node sebelum FFC bisa diproses pada pilihan gambar tertentu.</p>
+      <div class="grid three">
         <label>
-          Input Gambar
-          <input id="image-file" type="file" accept=".png,.jpg,.jpeg,.tif,.tiff,.bmp" />
+          <span class="img-label dark">Dark Frame</span>
+          <span class="img-hint">Gambar tanpa eksposur X-ray (sensor noise)</span>
+          <input id="image-dark" type="file" accept=".png,.jpg,.jpeg,.tif,.tiff,.bmp" />
+        </label>
+        <label>
+          <span class="img-label gain">Gain / Flat Frame</span>
+          <span class="img-hint">Gambar eksposur uniform (tanpa objek)</span>
+          <input id="image-gain" type="file" accept=".png,.jpg,.jpeg,.tif,.tiff,.bmp" />
+        </label>
+        <label>
+          <span class="img-label raw">Raw Frame</span>
+          <span class="img-hint">Gambar radiograph yang ingin diproses</span>
+          <input id="image-raw" type="file" accept=".png,.jpg,.jpeg,.tif,.tiff,.bmp" />
         </label>
       </div>
     </section>
@@ -61,7 +73,7 @@
     </section>
   </main>
 
-  <!-- No packages in config — installed via micropip in app.py with loading feedback -->
+  <!-- Packages installed via pyscript.toml config; app.py runs after boot -->
   <script type="py" src="./app.py" config="./pyscript.toml"></script>
 </body>
 </html>

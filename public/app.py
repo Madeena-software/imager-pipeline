@@ -1,23 +1,21 @@
 """
 Image Pipeline Node Editor — PyScript Frontend.
 
-Installs dependencies via micropip with loading feedback (including opencv-python
-from Pyodide's pre-built Wasm packages). Imports pipeline functions from
-complete_pipeline and imagej_replicator (both inside public/).
-If imports fail, errors are shown prominently in the UI.
+All heavy packages (numpy, opencv, scipy, scikit-image, PyWavelets, etc.) are
+installed by PyScript from pyscript.toml *before* this script executes.
+Pipeline modules (complete_pipeline, imagej_replicator, etc.) are fetched
+via the [files] section of pyscript.toml and available as regular imports.
 """
 
 from js import document, window
+from pyscript import when
+from io import BytesIO
 import json
 
+import numpy as np
+from PIL import Image
+
 # ─── Loading helpers ─────────────────────────────────────────────────────────
-
-
-def _update_loading(msg: str):
-    """Update the loading overlay status text."""
-    el = document.querySelector("#loading-status")
-    if el:
-        el.textContent = msg
 
 
 def _hide_loading():
@@ -38,69 +36,15 @@ def _show_error_banner(html: str):
         banner.style.display = "block"
 
 
-# ─── Phase 1: Install packages via micropip ──────────────────────────────────
-# opencv-python is available as a Pyodide pre-built Wasm package.
-# Note: cv2.imshow / HighGUI won't work in browser, but all array
-# operations (threshold, filter, bitwise_not, etc.) work fine.
+# ─── Import pipeline processor ───────────────────────────────────────────────
 
-import micropip
-
-_PACKAGES = [
-    "numpy",
-    "Pillow",
-    "opencv-python",  # Pyodide Wasm build — NOT a regular PyPI wheel
-    "scipy",
-    "scikit-image",
-    "PyWavelets",
-    "matplotlib",  # optional — used only for debug histograms
-]
-
-for _pkg in _PACKAGES:
-    _update_loading(f"Installing {_pkg}...")
-    try:
-        await micropip.install(_pkg)
-    except Exception as _e:
-        # Non-fatal: will surface later as import error if needed
-        _update_loading(f"Warning: {_pkg} install failed ({_e})")
-
-_update_loading("Packages installed. Loading modules...")
-
-# ─── Phase 2: Import core modules ────────────────────────────────────────────
-
-from io import BytesIO
-from pyscript import when
-
-import numpy as np
-from PIL import Image
-
-# ─── Phase 3: Import pipeline processor ──────────────────────────────────────
-
-_update_loading("Importing pipeline processor...")
-
-_pipeline_load_error = ""
+_pipeline_load_error = None
 IMPORT_ERRORS = {}
 
 try:
     from browser_processor import get_import_status, run_pipeline, IMPORT_ERRORS
 except Exception as exc:
     _pipeline_load_error = str(exc)
-
-# ─── Phase 4: Hide loading, reveal app, show errors ─────────────────────────
-
-_hide_loading()
-
-if _pipeline_load_error:
-    _show_error_banner(
-        f"<strong>Failed to load pipeline module:</strong> {_pipeline_load_error}"
-    )
-elif IMPORT_ERRORS:
-    _items = "".join(
-        f"<li><code>{mod}</code>: {err}</li>" for mod, err in IMPORT_ERRORS.items()
-    )
-    _show_error_banner(
-        "<strong>Some pipeline imports failed (affected nodes will show errors when run):</strong>"
-        f"<ul>{_items}</ul>"
-    )
 
 # ─── Node definitions ────────────────────────────────────────────────────────
 
@@ -113,6 +57,8 @@ NODE_DEFS = {
             "method": "BayesShrink",
             "mode": "soft",
         },
+        "note": "Wavelet: sym4/db4/haar | Method: BayesShrink (adaptive) / VisuShrink (universal) | Mode: soft (less artifact) / hard (sharper)",
+        "pre_ffc": True,
     },
     "crop_rotate": {
         "label": "Crop + Rotate Detector",
@@ -123,14 +69,27 @@ NODE_DEFS = {
             "left": 0,
             "right": 0,
         },
+        "note": "detector_type: BED (tanpa rotasi) / TRX (rotasi 90° CCW) | top/bottom/left/right: pixel crop",
+        "pre_ffc": True,
+    },
+    "flat_field_correction": {
+        "label": "Flat-Field Correction (FFC)",
+        "default": {},
+        "note": "Rumus: (raw - dark) / (gain - dark) × mean(gain - dark). Butuh 3 gambar: dark, gain, raw. Node ini menggabungkan 3 gambar menjadi 1.",
+        "pre_ffc": False,
+        "is_ffc": True,
     },
     "threshold_auto": {
         "label": "Auto Threshold + Separation",
         "default": {},
+        "note": "Deteksi threshold otomatis lalu pisahkan foreground/background. Tidak ada parameter.",
+        "pre_ffc": False,
     },
     "invert": {
         "label": "Invert",
         "default": {},
+        "note": "Membalik intensitas gambar (putih ↔ hitam). Tidak ada parameter.",
+        "pre_ffc": False,
     },
     "enhance_contrast": {
         "label": "Enhance Contrast (ImageJ)",
@@ -140,6 +99,8 @@ NODE_DEFS = {
             "equalize": True,
             "classic_equalization": False,
         },
+        "note": "saturated_pixels: % piksel yang di-saturate (0.1-10) | normalize: stretch histogram ke full range | equalize: equalisasi histogram | classic: metode equalisasi klasik",
+        "pre_ffc": False,
     },
     "clahe": {
         "label": "CLAHE (ImageJ)",
@@ -150,10 +111,14 @@ NODE_DEFS = {
             "fast": False,
             "composite": True,
         },
+        "note": "blocksize: ukuran blok (ganjil, 1-999) | histogram_bins: jumlah bin histogram (2-65536) | max_slope: batas kontras/slope (0.1-10) | fast: mode cepat | composite: gabungkan hasil",
+        "pre_ffc": False,
     },
     "normalize": {
         "label": "Normalize Max Value",
         "default": {"saturated_pixels": 0.35},
+        "note": "saturated_pixels: % piksel saturasi untuk histogram stretch (0.01-5). Makin kecil, makin lebar stretch.",
+        "pre_ffc": False,
     },
     "median_filter": {
         "label": "Advanced Median Filter",
@@ -161,11 +126,16 @@ NODE_DEFS = {
             "filter_type": "hybrid_imagej",
             "radius": 2,
         },
+        "note": "filter_type: standard/bilateral/adaptive/nlm/morphological/hybrid_imagej/circular_imagej | radius: ukuran kernel (1-10). hybrid_imagej terbaik untuk X-ray.",
+        "pre_ffc": False,
     },
 }
 
 pipeline_nodes = []
 result_data_url = None
+
+# Default apply_to targets for pre-FFC nodes
+DEFAULT_APPLY_TO = ["dark", "gain", "raw"]
 
 
 def status(msg):
@@ -211,15 +181,25 @@ def build_pipeline_payload():
         except Exception:
             raise ValueError(f"Params JSON tidak valid di node #{index + 1}")
 
-        nodes.append(
-            {
-                "type": node["type"],
-                "params": params,
-            }
-        )
+        node_data = {
+            "type": node["type"],
+            "params": params,
+        }
+
+        # For pre-FFC nodes, read apply_to checkboxes
+        node_def = NODE_DEFS.get(node["type"], {})
+        if node_def.get("pre_ffc", False):
+            apply_to = []
+            for target in DEFAULT_APPLY_TO:
+                cb = document.querySelector(f"#node-apply-{index}-{target}")
+                if cb and cb.checked:
+                    apply_to.append(target)
+            node_data["apply_to"] = apply_to if apply_to else list(DEFAULT_APPLY_TO)
+
+        nodes.append(node_data)
 
     return {
-        "version": 1,
+        "version": 2,
         "nodes": nodes,
     }
 
@@ -234,6 +214,11 @@ def render_node_types():
         select.appendChild(option)
 
 
+def _pipeline_has_ffc() -> bool:
+    """Check if any node in current pipeline is FFC."""
+    return any(n["type"] == "flat_field_correction" for n in pipeline_nodes)
+
+
 def render_pipeline():
     container = document.querySelector("#pipeline-list")
     empty_state = document.querySelector("#pipeline-empty")
@@ -246,7 +231,10 @@ def render_pipeline():
     empty_state.style.display = "none"
     container.innerHTML = ""
 
+    has_ffc = _pipeline_has_ffc()
+
     for index, node in enumerate(pipeline_nodes):
+        node_def = NODE_DEFS[node["type"]]
         card = document.createElement("div")
         card.className = "node-card"
 
@@ -254,7 +242,7 @@ def render_pipeline():
         head.className = "node-head"
 
         title = document.createElement("strong")
-        title.textContent = f"{index + 1}. {NODE_DEFS[node['type']]['label']}"
+        title.textContent = f"{index + 1}. {node_def['label']}"
 
         actions = document.createElement("div")
         actions.className = "node-actions"
@@ -277,13 +265,64 @@ def render_pipeline():
 
         head.appendChild(title)
         head.appendChild(actions)
-
-        textarea = document.createElement("textarea")
-        textarea.id = f"node-params-{index}"
-        textarea.value = json.dumps(node["params"], indent=2)
-
         card.appendChild(head)
-        card.appendChild(textarea)
+
+        # Show apply_to checkboxes for pre-FFC nodes (only when FFC is in pipeline)
+        if node_def.get("pre_ffc", False) and has_ffc:
+            apply_label = document.createElement("div")
+            apply_label.className = "apply-to-label"
+            apply_label.textContent = "Terapkan pada gambar:"
+            card.appendChild(apply_label)
+
+            apply_row = document.createElement("div")
+            apply_row.className = "apply-to-row"
+
+            current_apply = node.get("apply_to", list(DEFAULT_APPLY_TO))
+
+            for target in DEFAULT_APPLY_TO:
+                lbl = document.createElement("label")
+                cb = document.createElement("input")
+                cb.type = "checkbox"
+                cb.id = f"node-apply-{index}-{target}"
+                cb.checked = target in current_apply
+                span = document.createElement("span")
+                span.textContent = target.capitalize()
+                lbl.appendChild(cb)
+                lbl.appendChild(span)
+                apply_row.appendChild(lbl)
+
+            card.appendChild(apply_row)
+
+        # Show FFC badge
+        if node_def.get("is_ffc", False):
+            ffc_badge = document.createElement("div")
+            ffc_badge.className = "apply-to-label"
+            ffc_badge.textContent = (
+                "⚡ Menggabungkan 3 gambar (dark, gain, raw) → 1 output"
+            )
+            card.appendChild(ffc_badge)
+
+        # Params textarea (skip for FFC which has no params)
+        if node["type"] != "flat_field_correction":
+            textarea = document.createElement("textarea")
+            textarea.id = f"node-params-{index}"
+            textarea.value = json.dumps(node["params"], indent=2)
+            card.appendChild(textarea)
+        else:
+            # Hidden empty textarea for payload building consistency
+            textarea = document.createElement("textarea")
+            textarea.id = f"node-params-{index}"
+            textarea.value = "{}"
+            textarea.style.display = "none"
+            card.appendChild(textarea)
+
+        # Show note
+        note_text = node_def.get("note", "")
+        if note_text:
+            note_el = document.createElement("div")
+            note_el.className = "node-note"
+            note_el.textContent = f"💡 {note_text}"
+            card.appendChild(note_el)
 
         if index < len(pipeline_nodes) - 1:
             arrow = document.createElement("div")
@@ -295,12 +334,13 @@ def render_pipeline():
 
 
 def add_node(node_type):
-    pipeline_nodes.append(
-        {
-            "type": node_type,
-            "params": dict(NODE_DEFS[node_type]["default"]),
-        }
-    )
+    node_data = {
+        "type": node_type,
+        "params": dict(NODE_DEFS[node_type]["default"]),
+    }
+    if NODE_DEFS[node_type].get("pre_ffc", False):
+        node_data["apply_to"] = list(DEFAULT_APPLY_TO)
+    pipeline_nodes.append(node_data)
     render_pipeline()
 
 
@@ -378,12 +418,13 @@ def on_load_pipeline(evt):
                 ntype = node.get("type")
                 if ntype not in NODE_DEFS:
                     continue
-                parsed.append(
-                    {
-                        "type": ntype,
-                        "params": node.get("params", {}),
-                    }
-                )
+                node_data = {
+                    "type": ntype,
+                    "params": node.get("params", {}),
+                }
+                if NODE_DEFS[ntype].get("pre_ffc", False):
+                    node_data["apply_to"] = node.get("apply_to", list(DEFAULT_APPLY_TO))
+                parsed.append(node_data)
 
             pipeline_nodes = parsed
             render_pipeline()
@@ -410,34 +451,105 @@ async def on_run_pipeline(_evt):
         status(str(exc))
         return
 
-    image_input = document.querySelector("#image-file")
-    if not image_input.files or image_input.files.length == 0:
-        status("Pilih file gambar dulu.")
-        return
+    nodes = payload.get("nodes", [])
 
-    status("Menjalankan pipeline di browser...")
+    # Check if pipeline contains FFC node
+    has_ffc = any(n["type"] == "flat_field_correction" for n in nodes)
 
-    try:
-        image_u8 = await load_image_as_u8(image_input.files.item(0))
-        result_u8, errors = run_pipeline(image_u8, payload.get("nodes", []))
-        result_data_url = uint8_to_png_data_url(result_u8)
+    if has_ffc:
+        # FFC mode: need 3 images
+        dark_input = document.querySelector("#image-dark")
+        gain_input = document.querySelector("#image-gain")
+        raw_input = document.querySelector("#image-raw")
 
-        img = document.querySelector("#result-preview")
-        img.src = result_data_url
-        img.style.display = "block"
+        if (
+            not dark_input.files
+            or dark_input.files.length == 0
+            or not gain_input.files
+            or gain_input.files.length == 0
+            or not raw_input.files
+            or raw_input.files.length == 0
+        ):
+            status(
+                "FFC membutuhkan 3 gambar: Dark, Gain, dan Raw. Pastikan semua ter-upload."
+            )
+            return
 
-        update_download_link(result_data_url)
+        status("Memuat 3 gambar untuk FFC...")
+        try:
+            dark_u8 = await load_image_as_u8(dark_input.files.item(0))
+            gain_u8 = await load_image_as_u8(gain_input.files.item(0))
+            raw_u8 = await load_image_as_u8(raw_input.files.item(0))
+        except Exception as exc:
+            status(f"Gagal memuat gambar: {exc}")
+            return
 
-        if errors:
-            status("Pipeline selesai dengan error: " + " | ".join(errors[:3]))
-        else:
-            status("Pipeline selesai. Hasil siap di-preview dan di-download.")
+        status("Menjalankan pipeline (FFC mode) di browser...")
+        try:
+            result_u8, errors = run_pipeline(
+                raw_u8,
+                nodes,
+                dark_image=dark_u8,
+                gain_image=gain_u8,
+            )
+            result_data_url = uint8_to_png_data_url(result_u8)
 
-    except Exception as exc:
-        status(f"Gagal menjalankan pipeline: {exc}")
+            img = document.querySelector("#result-preview")
+            img.src = result_data_url
+            img.style.display = "block"
+
+            update_download_link(result_data_url)
+
+            if errors:
+                status("Pipeline selesai dengan error: " + " | ".join(errors[:3]))
+            else:
+                status("Pipeline selesai (FFC). Hasil siap di-preview dan di-download.")
+        except Exception as exc:
+            status(f"Gagal menjalankan pipeline: {exc}")
+
+    else:
+        # Non-FFC mode: only need raw image
+        raw_input = document.querySelector("#image-raw")
+        if not raw_input.files or raw_input.files.length == 0:
+            status("Pilih minimal gambar Raw.")
+            return
+
+        status("Menjalankan pipeline di browser...")
+        try:
+            image_u8 = await load_image_as_u8(raw_input.files.item(0))
+            result_u8, errors = run_pipeline(image_u8, nodes)
+            result_data_url = uint8_to_png_data_url(result_u8)
+
+            img = document.querySelector("#result-preview")
+            img.src = result_data_url
+            img.style.display = "block"
+
+            update_download_link(result_data_url)
+
+            if errors:
+                status("Pipeline selesai dengan error: " + " | ".join(errors[:3]))
+            else:
+                status("Pipeline selesai. Hasil siap di-preview dan di-download.")
+        except Exception as exc:
+            status(f"Gagal menjalankan pipeline: {exc}")
 
 
 # ─── Init ─────────────────────────────────────────────────────────────────────
+
+_hide_loading()
+
+if _pipeline_load_error:
+    _show_error_banner(
+        f"<strong>Failed to load pipeline module:</strong> {_pipeline_load_error}"
+    )
+elif IMPORT_ERRORS:
+    _items = "".join(
+        f"<li><code>{mod}</code>: {err}</li>" for mod, err in IMPORT_ERRORS.items()
+    )
+    _show_error_banner(
+        "<strong>Some pipeline imports failed (affected nodes will show errors when run):</strong>"
+        f"<ul>{_items}</ul>"
+    )
 
 render_node_types()
 render_pipeline()

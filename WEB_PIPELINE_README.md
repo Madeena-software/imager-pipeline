@@ -1,43 +1,36 @@
-# Node-based Image Pipeline Web (Frontend-only PyScript)
+# Image Pipeline — PyScript Web App
 
 ## Ringkasan
-Implementasi ini menyediakan:
-- Web UI berbasis PyScript untuk merangkai pipeline model node (urutan node).
-- Load/Save pipeline JSON (tanpa login).
-- Eksekusi pipeline langsung di browser (tanpa backend wajib).
 
-Frontend ada di folder `public/` (siap untuk Firebase Hosting).
+Web app untuk merangkai dan menjalankan image processing pipeline langsung di browser menggunakan **PyScript** (Pyodide/Wasm). Tidak ada backend/API — semua proses berjalan 100% di sisi client.
 
-> Catatan: app akan mencoba import fungsi dari repo jika runtime browser mendukung.
-> Jika gagal (umumnya karena dependency native seperti `cv2`), app otomatis fallback ke processor kompatibel browser.
+Fitur:
+- Node-based pipeline builder (drag & reorder)
+- Load/Save pipeline JSON
+- Flat-Field Correction (FFC) dengan 3 gambar: dark, gain, raw
+- Semua image processing (denoise, CLAHE, threshold, dll.) jalan di browser
+
+Frontend ada di folder `public/`.
 
 ---
 
-## 1) Jalankan frontend lokal
+## Cara Menjalankan
 
-Karena PyScript berjalan di browser, frontend bisa disajikan dari folder `public`:
+PyScript perlu disajikan via HTTP (tidak bisa buka `file://` langsung). Jalankan static server:
 
 ```bash
 python -m http.server 5500 --directory public
 ```
 
-Buka:
-
-```bash
-http://127.0.0.1:5500
-```
-
-Default API URL di UI adalah `http://127.0.0.1:8000`.
-
-Tidak perlu menjalankan API backend untuk mode ini.
+Buka: http://127.0.0.1:5500
 
 ---
 
-## 2) Format pipeline JSON
+## Format Pipeline JSON
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "nodes": [
     { "type": "denoise_wavelet", "params": { "wavelet": "sym4", "level": 3, "method": "BayesShrink", "mode": "soft" } },
     { "type": "threshold_auto", "params": {} },
@@ -48,25 +41,20 @@ Tidak perlu menjalankan API backend untuk mode ini.
 ```
 
 Node yang tersedia:
-- `denoise_wavelet`
-- `crop_rotate`
-- `threshold_auto`
-- `invert`
-- `enhance_contrast`
-- `clahe`
-- `normalize`
-- `median_filter`
+- `denoise_wavelet` — Wavelet denoising (sym4/db4/haar)
+- `crop_rotate` — Crop dan rotasi untuk detektor (BED/TRX)
+- `flat_field_correction` — FFC (butuh 3 gambar)
+- `threshold_auto` — Auto threshold + separation
+- `invert` — Balik intensitas
+- `enhance_contrast` — Enhance contrast (ImageJ-style)
+- `clahe` — CLAHE (ImageJ-style)
+- `normalize` — Normalize intensitas
+- `median_filter` — Advanced median filter
 
 ---
 
-## 3) Deploy ke Firebase Hosting
-
-Frontend static bisa langsung deploy:
+## Deploy ke Firebase Hosting
 
 ```bash
 firebase deploy --only hosting
 ```
-
-### Catatan kompatibilitas
-- Mode frontend-only cocok untuk demo, kolaborasi, dan eksplorasi pipeline tim.
-- Beberapa node dijalankan dengan pendekatan kompatibel browser (approximation), terutama ketika dependency native dari repo tidak tersedia di runtime PyScript.
