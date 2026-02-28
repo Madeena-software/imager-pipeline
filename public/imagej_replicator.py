@@ -20,6 +20,7 @@ import numpy as np
 import math
 from typing import Optional, Tuple, Union
 from scipy.ndimage import gaussian_filter1d, median_filter
+
 try:
     from concurrent.futures import ThreadPoolExecutor
 except ImportError:
@@ -1001,9 +1002,7 @@ class ImageJReplicator:
             # ----------------------------------------------------------
             # Mode tanpa normalisasi intensitas
             # ----------------------------------------------------------
-            for idx, k in enumerate(
-                range(start_frame - 1, end_frame - window_size)
-            ):
+            for idx, k in enumerate(range(start_frame - 1, end_frame - window_size)):
                 # Ekstrak jendela temporal: frame k sampai k+window_size-1
                 window = stack[k : k + window_size]
 
@@ -1027,16 +1026,12 @@ class ImageJReplicator:
                 axis=(1, 2),
             )
 
-            for idx, k in enumerate(
-                range(start_frame - 1, end_frame - window_size)
-            ):
+            for idx, k in enumerate(range(start_frame - 1, end_frame - window_size)):
                 window = stack[k : k + window_size].astype(np.float64)
 
                 # Indeks ke dalam frame_means: offset dari start_frame-1
                 means_offset = k - (start_frame - 1)
-                w_means = frame_means[
-                    means_offset : means_offset + window_size
-                ]
+                w_means = frame_means[means_offset : means_offset + window_size]
 
                 # Hindari pembagian dengan nol
                 safe_means = np.where(w_means > 0, w_means, 1.0)
@@ -1044,15 +1039,11 @@ class ImageJReplicator:
                 # Normalisasi: value_norm = int(pixel / mean_frame * 1000)
                 # Mereplikasi: (int)(((float)pixels[j]/(float)mean[...])*1000)
                 normalized = (
-                    window
-                    / safe_means[:, np.newaxis, np.newaxis]
-                    * 1000.0
+                    window / safe_means[:, np.newaxis, np.newaxis] * 1000.0
                 ).astype(np.int32)
 
                 # Hitung median dari nilai ternormalisasi
-                partitioned = np.partition(
-                    normalized, median_rank, axis=0
-                )
+                partitioned = np.partition(normalized, median_rank, axis=0)
                 norm_median = partitioned[median_rank].astype(np.float64)
 
                 # De-normalisasi median dan kurangi dari frame asli
@@ -1160,8 +1151,7 @@ class ImageJReplicator:
         if len(image.shape) == 3:
             channels = cv2.split(image)
             processed = [
-                ImageJReplicator.median_filter_imagej(ch, radius)
-                for ch in channels
+                ImageJReplicator.median_filter_imagej(ch, radius) for ch in channels
             ]
             return cv2.merge(processed)
 
@@ -1170,8 +1160,6 @@ class ImageJReplicator:
 
         # Terapkan median filter dengan kernel lingkaran
         # mode='nearest' mereplikasi PADDING_DUPLICATE dari ImageJ
-        result = median_filter(
-            image, footprint=footprint, mode='nearest'
-        )
+        result = median_filter(image, footprint=footprint, mode="nearest")
 
         return result.astype(original_dtype)

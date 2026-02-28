@@ -174,7 +174,11 @@ def _apply_node_to_image(
                 return image, _import_err(label, "imagej_replicator")
             ij = _ImageJReplicator()
             # ImageJ enhance_contrast expects uint8/uint16, not float32
-            img_u8 = _from_float01(image) if image.dtype in (np.float32, np.float64) else image
+            img_u8 = (
+                _from_float01(image)
+                if image.dtype in (np.float32, np.float64)
+                else image
+            )
             result = ij.enhance_contrast(
                 img_u8,
                 saturated_pixels=float(params.get("saturated_pixels", 5.0)),
@@ -188,7 +192,11 @@ def _apply_node_to_image(
                 return image, _import_err(label, "imagej_replicator")
             ij = _ImageJReplicator()
             # CLAHE expects uint8/uint16, not float32
-            img_u8 = _from_float01(image) if image.dtype in (np.float32, np.float64) else image
+            img_u8 = (
+                _from_float01(image)
+                if image.dtype in (np.float32, np.float64)
+                else image
+            )
             result = ij.apply_clahe(
                 img_u8,
                 blocksize=int(params.get("blocksize", 127)),
