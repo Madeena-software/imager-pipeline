@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Image Pipeline Node Editor</title>
+  <link rel="stylesheet" href="https://pyscript.net/releases/2025.3.1/core.css" />
+  <link rel="stylesheet" href="./styles.css" />
+  <script type="module" src="https://pyscript.net/releases/2025.3.1/core.js"></script>
+</head>
+<body>
+  <!-- Loading overlay — visible while PyScript boots and micropip installs packages -->
+  <div id="loading-overlay" class="loading-overlay">
+    <div class="loading-content">
+      <div class="spinner"></div>
+      <h2>Loading Image Pipeline...</h2>
+      <p id="loading-status">Initializing PyScript runtime...</p>
+    </div>
+  </div>
+
+  <main class="container" id="app-container" style="display: none;">
+    <h1>Image Pipeline Node Editor (PyScript)</h1>
+    <p class="subtitle">Buat pipeline node, simpan/load JSON, lalu jalankan lokal di browser.</p>
+
+    <!-- Import error banner — shown when pipeline module imports fail -->
+    <div id="import-error-banner" class="error-banner" style="display: none;"></div>
+
+    <section class="panel">
+      <h2>Konfigurasi</h2>
+      <div class="grid two">
+        <label>
+          Input Gambar
+          <input id="image-file" type="file" accept=".png,.jpg,.jpeg,.tif,.tiff,.bmp" />
+        </label>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Node Builder</h2>
+      <div class="toolbar">
+        <select id="node-type"></select>
+        <button id="add-node-btn">Tambah Node</button>
+        <button id="save-pipeline-btn">Save Pipeline JSON</button>
+        <label class="load-btn" for="load-pipeline-file">Load Pipeline JSON</label>
+        <input id="load-pipeline-file" type="file" accept="application/json" />
+        <button id="run-pipeline-btn" class="run">Run Pipeline</button>
+      </div>
+      <div id="pipeline-empty" class="empty">Belum ada node. Tambahkan node dari dropdown di atas.</div>
+      <div id="pipeline-list"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Output</h2>
+      <div id="status" class="status">Idle</div>
+      <div class="output-actions">
+        <a id="download-result" class="disabled" href="#" download="pipeline_result.png">Download Hasil</a>
+      </div>
+      <div class="preview-wrap">
+        <img id="result-preview" alt="Preview hasil pipeline" />
+      </div>
+    </section>
+  </main>
+
+  <!-- No packages in config — installed via micropip in app.py with loading feedback -->
+  <script type="py" src="./app.py" config="./pyscript.toml"></script>
+</body>
+</html>
