@@ -54,6 +54,9 @@ def load_env_config():
         "DARK_PATH": "",
         "FLAT_PATH": "",
         "OUTPUT_DIR": "",
+        # Camera calibration
+        "USE_CALIBRATION": False,
+        "CALIBRATION_NPZ_PATH": "",
     }
 
     if os.path.exists(env_path):
@@ -225,6 +228,17 @@ except ImportError:
         "Warning: imagej_replicator module not available. ImageJ processing disabled."
     )
 
+# Import camera calibration
+try:
+    from camera_calibration import undistort_image
+
+    CALIBRATION_MODULE_AVAILABLE = True
+except ImportError:
+    CALIBRATION_MODULE_AVAILABLE = False
+    print(
+        "Warning: camera_calibration module not available. Camera calibration disabled."
+    )
+
 # Check if ImageJ should be used (must have module AND .env flag enabled)
 IMAGEJ_AVAILABLE = IMAGEJ_MODULE_AVAILABLE and get_use_imagej_flag()
 
@@ -234,6 +248,27 @@ elif IMAGEJ_MODULE_AVAILABLE and not get_use_imagej_flag():
     print("✗ ImageJ processing disabled (USE_IMAGEJ=False in .env)")
 else:
     print("✗ ImageJ processing not available (imagej_replicator not installed)")
+
+# Check if camera calibration should be used
+CALIBRATION_AVAILABLE = (
+    CALIBRATION_MODULE_AVAILABLE
+    and CONFIG["USE_CALIBRATION"]
+    and CONFIG["CALIBRATION_NPZ_PATH"]
+    and os.path.exists(CONFIG["CALIBRATION_NPZ_PATH"])
+)
+
+if CALIBRATION_AVAILABLE:
+    print(f"✓ Camera calibration enabled (NPZ: {CONFIG['CALIBRATION_NPZ_PATH']})")
+elif CONFIG["USE_CALIBRATION"] and not CONFIG["CALIBRATION_NPZ_PATH"]:
+    print("✗ Camera calibration disabled (CALIBRATION_NPZ_PATH not set)")
+elif CONFIG["USE_CALIBRATION"] and not os.path.exists(CONFIG["CALIBRATION_NPZ_PATH"]):
+    print(
+        f"✗ Camera calibration disabled (NPZ file not found: {CONFIG['CALIBRATION_NPZ_PATH']})"
+    )
+elif not CALIBRATION_MODULE_AVAILABLE and CONFIG["USE_CALIBRATION"]:
+    print("✗ Camera calibration disabled (camera_calibration module not available)")
+else:
+    print("✗ Camera calibration disabled (USE_CALIBRATION=False)")
 
 
 def denoise_wavelet(image, wavelet="sym4", level=3, method="BayesShrink", mode="soft"):
@@ -1062,7 +1097,51 @@ def process_single_image(
         title="Cropped Raw Histogram",
     )
 
-    # Step 2: Denoise using wavelet (now works with float32 [0,1])
+    # Step 2.5: Apply camera calibration (fish-eye correction) if enabled
+    if CONFIG.get("USE_CALIBRATION", False) and CALIBRATION_AVAILABLE:
+        print("  [2.5/10] Applying camera calibration (fish-eye correction)...")
+        try:
+            # Apply calibration to all three images
+            dark_calibrated = undistort_image(
+                dark_cropped, CONFIG["CALIBRATION_NPZ_PATH"]
+            )
+            flat_calibrated = undistort_image(
+                flat_cropped, CONFIG["CALIBRATION_NPZ_PATH"]
+            )
+            raw_calibrated = undistort_image(
+                raw_cropped, CONFIG["CALIBRATION_NPZ_PATH"]
+            )
+
+            # Convert back to float32 [0,1] range if needed
+            if dark_calibrated.dtype != np.float32:
+                dark_calibrated = dark_calibrated.astype(np.float32) / MAX_16BIT
+                flat_calibrated = flat_calibrated.astype(np.float32) / MAX_16BIT
+                raw_calibrated = raw_calibrated.astype(np.float32) / MAX_16BIT
+
+            print(f"    Calibrated shape: {raw_calibrated.shape}")
+
+            save_histogram(
+                raw_calibrated,
+                os.path.join(debug_dir, f"histogram_calibrated_{image_id}.png"),
+                title="Calibrated Raw Histogram",
+            )
+
+        except Exception as e:
+            print(
+                f"    Warning: Calibration failed ({str(e)}), proceeding without calibration"
+            )
+            # Continue with uncalibrated images
+            dark_calibrated = dark_cropped
+            flat_calibrated = flat_cropped
+            raw_calibrated = raw_cropped
+    else:
+        print("  [2.5/10] Camera calibration skipped")
+        # Use cropped images as-is
+        dark_calibrated = dark_cropped
+        flat_calibrated = flat_cropped
+        raw_calibrated = raw_cropped
+
+    # Step 3: Denoise using wavelet (now works with float32 [0,1])
     wavelet_type = CONFIG["WAVELET_TYPE"]
     wavelet_level = CONFIG["WAVELET_LEVEL"]
     wavelet_method = CONFIG["WAVELET_METHOD"]
@@ -1071,21 +1150,21 @@ def process_single_image(
         f"  [3/10] Denoising images (wavelet: {wavelet_type}, level={wavelet_level}, {wavelet_method}, {wavelet_mode})..."
     )
     dark_denoised = denoise_wavelet(
-        dark_cropped,
+        dark_calibrated,
         wavelet=wavelet_type,
         level=wavelet_level,
         method=wavelet_method,
         mode=wavelet_mode,
     )
     flat_denoised = denoise_wavelet(
-        flat_cropped,
+        flat_calibrated,
         wavelet=wavelet_type,
         level=wavelet_level,
         method=wavelet_method,
         mode=wavelet_mode,
     )
     raw_denoised = denoise_wavelet(
-        raw_cropped,
+        raw_calibrated,
         wavelet=wavelet_type,
         level=wavelet_level,
         method=wavelet_method,
@@ -1098,7 +1177,7 @@ def process_single_image(
         title="Denoised Raw Histogram",
     )
 
-    # Step 3: FFC with matched dimensions
+    # Step 4: FFC with matched dimensions
     print("  [4/10] Applying Flat-Field Correction...")
     ffc_result = flat_field_correction(raw_denoised, dark_denoised, flat_denoised)
     print(f"    FFC output range: {ffc_result.min()} - {ffc_result.max()}")
@@ -1109,7 +1188,7 @@ def process_single_image(
         title="FFC Result Histogram (Normalized 0-1)",
     )
 
-    # Step 4: Normalize to configurable bit depth (optional)
+    # Step 5: Normalize to configurable bit depth (optional)
     if CONFIG.get("USE_NORMALIZE", False):
         print(f"  [5/10] Normalizing to max value {MAX_16BIT}...")
         normalized_result = normalize_to_max_value(ffc_result, MAX_16BIT)
@@ -1130,7 +1209,7 @@ def process_single_image(
                 "    [DEBUG] Normalization step was skipped. Passing FFC result forward."
             )
 
-    # Step 5: Auto Thresholding (optional)
+    # Step 6: Auto Thresholding (optional)
     threshold_method = CONFIG.get("THRESHOLD_METHOD", "auto").lower()
     if threshold_method in ["none", "off", "skip", "no"]:
         print("  [6/10] Thresholding skipped (THRESHOLD_METHOD set to 'none'/'off')")
@@ -1167,7 +1246,7 @@ def process_single_image(
             title="Thresholded Result Histogram",
         )
 
-    # Step 6: Invert
+    # Step 7: Invert
     print("  [7/10] Inverting image...")
     inverted = invert_image(threshold_result)
 
@@ -1177,7 +1256,7 @@ def process_single_image(
         title="Inverted Result Histogram",
     )
 
-    # Step 7: Enhance Contrast using ImageJ Replicator
+    # Step 8: Enhance Contrast using ImageJ Replicator
     print("  [8/10] Enhancing contrast (ImageJ method)")
     if not CONFIG["USE_CONTRAST_ENHANCEMENT"]:
         print("    Skipping contrast enhancement (USE_CONTRAST_ENHANCEMENT=False)")
@@ -1216,7 +1295,7 @@ def process_single_image(
         title="Enhanced Result Histogram",
     )
 
-    # Step 7: Apply CLAHE using ImageJ Replicator
+    # Step 9: Apply CLAHE using ImageJ Replicator
     # Parameter guide (ImageJ CLAHE style):
     #   blocksize: 127 = default ImageJ (127 pixels tile)
     #              63  = smaller tiles (more local detail)
