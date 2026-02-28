@@ -57,6 +57,7 @@ def load_env_config():
         # Camera calibration
         "USE_CALIBRATION": False,
         "CALIBRATION_NPZ_PATH": "",
+        "CALIBRATION_UNDISTORT_ALPHA": 0.0,
     }
 
     if os.path.exists(env_path):
@@ -88,6 +89,7 @@ def load_env_config():
                         "CONTRAST_CLASSIC_EQUALIZATION",
                         "CLAHE_FAST",
                         "CLAHE_COMPOSITE",
+                        "USE_CALIBRATION",
                     ]:
                         config[key] = value.lower() in ["1", "true", "yes", "on"]
                     # Parse integer values
@@ -109,6 +111,7 @@ def load_env_config():
                         "CLAHE_MAX_SLOPE",
                         "CONTRAST_SATURATED_PIXELS",
                         "NORMALIZE_SATURATED_PIXELS",
+                        "CALIBRATION_UNDISTORT_ALPHA",
                     ]:
                         if value:
                             config[key] = float(value)
@@ -1075,13 +1078,60 @@ def process_single_image(
     dark_image = dark_image.astype(np.float32) / MAX_16BIT
     flat_image = flat_image.astype(np.float32) / MAX_16BIT
 
-    # Step 1: Crop and rotate images - ALL images must be transformed identically
-    print(f"  [2/10] Cropping and rotating ({detector_type})...")
+    # Step 1: Apply camera calibration (fish-eye correction) before geometric transforms
+    if CONFIG.get("USE_CALIBRATION", False) and CALIBRATION_AVAILABLE:
+        print("  [2/10] Applying camera calibration (fish-eye correction)...")
+        try:
+            dark_calibrated = undistort_image(
+                dark_image,
+                CONFIG["CALIBRATION_NPZ_PATH"],
+                alpha=CONFIG.get("CALIBRATION_UNDISTORT_ALPHA", 0.0),
+                crop_to_roi=False,
+            )
+            flat_calibrated = undistort_image(
+                flat_image,
+                CONFIG["CALIBRATION_NPZ_PATH"],
+                alpha=CONFIG.get("CALIBRATION_UNDISTORT_ALPHA", 0.0),
+                crop_to_roi=False,
+            )
+            raw_calibrated = undistort_image(
+                raw_image,
+                CONFIG["CALIBRATION_NPZ_PATH"],
+                alpha=CONFIG.get("CALIBRATION_UNDISTORT_ALPHA", 0.0),
+                crop_to_roi=False,
+            )
 
-    # Apply same transformation to all three images
-    dark_cropped = crop_and_rotate_by_detector(dark_image, detector_type)
-    flat_cropped = crop_and_rotate_by_detector(flat_image, detector_type)
-    raw_cropped = crop_and_rotate_by_detector(raw_image, detector_type)
+            if dark_calibrated.dtype != np.float32:
+                dark_calibrated = dark_calibrated.astype(np.float32) / MAX_16BIT
+                flat_calibrated = flat_calibrated.astype(np.float32) / MAX_16BIT
+                raw_calibrated = raw_calibrated.astype(np.float32) / MAX_16BIT
+
+            print(f"    Calibrated shape: {raw_calibrated.shape}")
+            save_histogram(
+                raw_calibrated,
+                os.path.join(debug_dir, f"histogram_calibrated_{image_id}.png"),
+                title="Calibrated Raw Histogram",
+            )
+
+        except Exception as e:
+            print(
+                f"    Warning: Calibration failed ({str(e)}), proceeding without calibration"
+            )
+            dark_calibrated = dark_image
+            flat_calibrated = flat_image
+            raw_calibrated = raw_image
+    else:
+        print("  [2/10] Camera calibration skipped")
+        dark_calibrated = dark_image
+        flat_calibrated = flat_image
+        raw_calibrated = raw_image
+
+    # Step 2: Crop and rotate images - ALL images must be transformed identically
+    print(f"  [2.5/10] Cropping and rotating ({detector_type})...")
+
+    dark_cropped = crop_and_rotate_by_detector(dark_calibrated, detector_type)
+    flat_cropped = crop_and_rotate_by_detector(flat_calibrated, detector_type)
+    raw_cropped = crop_and_rotate_by_detector(raw_calibrated, detector_type)
 
     crop_info = f"top={CONFIG['CROP_TOP']}, bottom={CONFIG['CROP_BOTTOM']}, left={CONFIG['CROP_LEFT']}, right={CONFIG['CROP_RIGHT']}"
     if detector_type == "TRX":
@@ -1097,49 +1147,9 @@ def process_single_image(
         title="Cropped Raw Histogram",
     )
 
-    # Step 2.5: Apply camera calibration (fish-eye correction) if enabled
-    if CONFIG.get("USE_CALIBRATION", False) and CALIBRATION_AVAILABLE:
-        print("  [2.5/10] Applying camera calibration (fish-eye correction)...")
-        try:
-            # Apply calibration to all three images
-            dark_calibrated = undistort_image(
-                dark_cropped, CONFIG["CALIBRATION_NPZ_PATH"]
-            )
-            flat_calibrated = undistort_image(
-                flat_cropped, CONFIG["CALIBRATION_NPZ_PATH"]
-            )
-            raw_calibrated = undistort_image(
-                raw_cropped, CONFIG["CALIBRATION_NPZ_PATH"]
-            )
-
-            # Convert back to float32 [0,1] range if needed
-            if dark_calibrated.dtype != np.float32:
-                dark_calibrated = dark_calibrated.astype(np.float32) / MAX_16BIT
-                flat_calibrated = flat_calibrated.astype(np.float32) / MAX_16BIT
-                raw_calibrated = raw_calibrated.astype(np.float32) / MAX_16BIT
-
-            print(f"    Calibrated shape: {raw_calibrated.shape}")
-
-            save_histogram(
-                raw_calibrated,
-                os.path.join(debug_dir, f"histogram_calibrated_{image_id}.png"),
-                title="Calibrated Raw Histogram",
-            )
-
-        except Exception as e:
-            print(
-                f"    Warning: Calibration failed ({str(e)}), proceeding without calibration"
-            )
-            # Continue with uncalibrated images
-            dark_calibrated = dark_cropped
-            flat_calibrated = flat_cropped
-            raw_calibrated = raw_cropped
-    else:
-        print("  [2.5/10] Camera calibration skipped")
-        # Use cropped images as-is
-        dark_calibrated = dark_cropped
-        flat_calibrated = flat_cropped
-        raw_calibrated = raw_cropped
+    dark_calibrated = dark_cropped
+    flat_calibrated = flat_cropped
+    raw_calibrated = raw_cropped
 
     # Step 3: Denoise using wavelet (now works with float32 [0,1])
     wavelet_type = CONFIG["WAVELET_TYPE"]

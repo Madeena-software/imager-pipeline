@@ -31,6 +31,7 @@ def load_calibration_config():
         "CALIBRATION_CUSTOM_ROI_Y": None,
         "CALIBRATION_CUSTOM_ROI_W": None,
         "CALIBRATION_CUSTOM_ROI_H": None,
+        "CALIBRATION_UNDISTORT_ALPHA": 0.0,
         "CALIBRATION_TEST_ENABLED": True,
         "CALIBRATION_TEST_OUTPUT": "",
     }
@@ -58,9 +59,15 @@ def load_calibration_config():
                                 config[key] = int(value) if value else None
                             except ValueError:
                                 pass
-                        elif key == "CALIBRATION_CIRCLE_DIAMETER":
+                        elif key in [
+                            "CALIBRATION_CIRCLE_DIAMETER",
+                            "CALIBRATION_UNDISTORT_ALPHA",
+                        ]:
                             try:
-                                config[key] = float(value) if value else 1.0
+                                default_value = (
+                                    1.0 if key == "CALIBRATION_CIRCLE_DIAMETER" else 0.0
+                                )
+                                config[key] = float(value) if value else default_value
                             except ValueError:
                                 pass
                         elif key == "CALIBRATION_TEST_ENABLED":
@@ -129,11 +136,10 @@ class CameraCalibrator:
         return False, None
 
     def _build_blob_detector(self):
-        """Build blob detector using circle diameter with ±10% tolerance."""
+        """Build blob detector tuned to the proven notebook settings."""
         params = cv2.SimpleBlobDetector_Params()
-        params.minThreshold = 5
-        params.maxThreshold = 255
-        params.thresholdStep = 5
+        params.filterByColor = True
+        params.blobColor = 255
 
         effective_circle_px = (
             self.circle_diameter
@@ -141,33 +147,71 @@ class CameraCalibrator:
             else 40.0
         )
 
-        if effective_circle_px > 0:
-            min_circle_px = effective_circle_px * (1.0 - self.CIRCLE_DIAMETER_TOLERANCE)
-            max_circle_px = effective_circle_px * (1.0 + self.CIRCLE_DIAMETER_TOLERANCE)
-            params.minArea = max(8, np.pi * (min_circle_px * 0.5) ** 2)
-            params.maxArea = max(9, np.pi * (max_circle_px * 0.5) ** 2)
-            params.maxArea = max(params.maxArea, params.minArea + 1.0)
-            params.minDistBetweenBlobs = max(2.0, effective_circle_px * 0.4)
-        else:
-            params.minArea = 8
-            params.maxArea = 5000
-
+        radius = effective_circle_px / 2.0
+        expected_area = np.pi * (radius**2)
         params.filterByArea = True
+        params.minArea = expected_area * 0.2
+        params.maxArea = expected_area * 3.5
 
         params.filterByCircularity = True
-        params.minCircularity = 0.35
-
-        params.filterByInertia = False
-
-        params.filterByConvexity = False
-
-        params.filterByColor = False
+        params.minCircularity = 0.7
+        params.filterByConvexity = True
+        params.minConvexity = 0.87
+        params.filterByInertia = True
+        params.minInertiaRatio = 0.5
 
         return cv2.SimpleBlobDetector_create(params)
 
     def _create_blob_detectors(self):
         """Create detector list."""
-        return [(self._build_blob_detector(), "circle-diameter±10%")]
+        return [(self._build_blob_detector(), "notebook-tuned")]
+
+    def _sort_keypoints_to_grid(self, keypoints):
+        """Fallback ordering when keypoint count exactly matches the target grid size."""
+        cols, rows = self.pattern_size
+        target_count = cols * rows
+        if len(keypoints) != target_count:
+            return None
+
+        pts = [kp.pt for kp in keypoints]
+        pts.sort(key=lambda point: point[1])
+
+        sorted_centers = []
+        for row_index in range(rows):
+            row_pts = pts[row_index * cols : (row_index + 1) * cols]
+            row_pts.sort(key=lambda point: point[0])
+            for point in row_pts:
+                sorted_centers.append([[point[0], point[1]]])
+
+        return np.array(sorted_centers, dtype=np.float32)
+
+    def _detect_circles_notebook_style(self, gray):
+        """Detect circles using the successful notebook approach plus manual fallback."""
+        detector = self.blob_detectors[0][0]
+        flags = cv2.CALIB_CB_SYMMETRIC_GRID | cv2.CALIB_CB_CLUSTERING
+        ret, centers = cv2.findCirclesGrid(
+            gray,
+            self.pattern_size,
+            flags=flags,
+            blobDetector=detector,
+        )
+
+        keypoints = detector.detect(gray)
+        if ret:
+            print("✓ Circles detected with symmetric+cluster")
+            return True, centers, keypoints
+
+        target_count = self.pattern_size[0] * self.pattern_size[1]
+        print(
+            f"OpenCV findCirclesGrid failed. Blob count: {len(keypoints)} / Target: {target_count}"
+        )
+
+        centers = self._sort_keypoints_to_grid(keypoints)
+        if centers is not None:
+            print("✓ Manual fallback ordering succeeded")
+            return True, centers, keypoints
+
+        return False, None, keypoints
 
     def _try_detect_on_image(self, img, label):
         """Try circle-grid detection with both symmetric and asymmetric flags."""
@@ -285,9 +329,9 @@ class CameraCalibrator:
         Returns:
             Tuple (success, centers) where success is bool and centers are detected points
         """
-        # Load image
+        # Load image (keep original bit depth, then normalize if needed)
         if isinstance(image_path, str):
-            img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+            img = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
         else:
             img = image_path
 
@@ -295,49 +339,30 @@ class CameraCalibrator:
             print(f"Error: Could not load image from {image_path}")
             return False, None
 
-        print(f"Image size: {img.shape}")
+        if len(img.shape) == 2:
+            gray = img
+        else:
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        if gray.dtype != np.uint8:
+            print(f"Converting image from {gray.dtype} to uint8...")
+            gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+
+        print(f"Image size: {gray.shape}")
         print(
             f"Looking for {self.pattern_size[0]}x{self.pattern_size[1]} circle grid..."
         )
 
-        # Fixed sequence: fastest to slowest
-        # 1) Direct grid detection (normal image variants)
-        # 2) Direct grid detection (inverted variants)
-        # 3) Hough-guided grid detection (normal variants)
-        # 4) Hough-guided grid detection (inverted variants)
-        variants = self._build_preprocessed_variants(img)
-        inv_variants = []
-        if invert_if_needed:
-            img_inv = cv2.bitwise_not(img)
-            inv_variants = self._build_preprocessed_variants(img_inv)
+        ret, centers, _ = self._detect_circles_notebook_style(gray)
+        if ret:
+            return True, centers
 
-        for variant_img, label in variants:
-            ret, centers = self._try_detect_on_image(variant_img, label)
+        if invert_if_needed:
+            print("Trying inverted image...")
+            gray_inv = cv2.bitwise_not(gray)
+            ret, centers, _ = self._detect_circles_notebook_style(gray_inv)
             if ret:
                 return True, centers
-
-        if invert_if_needed:
-            print("Trying inverted image variants...")
-            for variant_img, label in inv_variants:
-                ret, centers = self._try_detect_on_image(
-                    variant_img, f"inverted/{label}"
-                )
-                if ret:
-                    return True, centers
-
-        print("Trying Hough-circle guided detection...")
-        for variant_img, label in variants:
-            ret, centers = self._try_hough_guided_detection(variant_img, label)
-            if ret:
-                return True, centers
-
-        if invert_if_needed:
-            for variant_img, label in inv_variants:
-                ret, centers = self._try_hough_guided_detection(
-                    variant_img, f"inverted/{label}"
-                )
-                if ret:
-                    return True, centers
 
         print("✗ No circles detected")
         return False, None
@@ -432,32 +457,18 @@ class CameraCalibrator:
         """
         print(f"Testing calibration on: {image_path}")
 
-        # Load calibration parameters
-        with np.load(npz_path) as params:
-            mtx = params["mtx"]
-            dist = params["dist"]
-            roi = params["roi"]
-            newcameramtx = params.get("newcameramtx", None)
-
         # Load test image
         img = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
         if img is None:
             print(f"Error: Could not load test image from {image_path}")
             return None
 
-        # Undistort image
-        if newcameramtx is not None:
-            undistorted = cv2.undistort(img, mtx, dist, None, newcameramtx)
-        else:
-            h, w = img.shape[:2]
-            newcameramtx, roi = cv2.getOptimalNewCameraMatrix(
-                mtx, dist, (w, h), 1, (w, h)
-            )
-            undistorted = cv2.undistort(img, mtx, dist, None, newcameramtx)
-
-        # Crop to ROI
-        x, y, w, h = roi
-        cropped = undistorted[y : y + h, x : x + w]
+        cropped = undistort_image(
+            img,
+            npz_path,
+            alpha=CALIBRATION_CONFIG["CALIBRATION_UNDISTORT_ALPHA"],
+            crop_to_roi=True,
+        )
 
         print(f"Original size: {img.shape}, Undistorted size: {cropped.shape}")
 
@@ -469,13 +480,38 @@ class CameraCalibrator:
         return cropped
 
 
-def undistort_image(image, npz_path):
+def _scale_camera_matrix(mtx, calibration_size, target_size):
+    """Scale camera intrinsics from calibration image size to target image size."""
+    if calibration_size is None:
+        return mtx.copy()
+
+    calib_w, calib_h = calibration_size
+    target_w, target_h = target_size
+
+    if calib_w <= 0 or calib_h <= 0:
+        return mtx.copy()
+
+    scale_x = target_w / float(calib_w)
+    scale_y = target_h / float(calib_h)
+
+    scaled = mtx.copy().astype(np.float64)
+    scaled[0, 0] *= scale_x  # fx
+    scaled[1, 1] *= scale_y  # fy
+    scaled[0, 2] *= scale_x  # cx
+    scaled[1, 2] *= scale_y  # cy
+    return scaled
+
+
+def undistort_image(image, npz_path, alpha=0.0, crop_to_roi=True):
     """
     Undistort an image using saved calibration parameters.
 
     Args:
         image: Input image as numpy array or path to image file
         npz_path: Path to calibration NPZ file
+        alpha: Free scaling parameter for getOptimalNewCameraMatrix.
+               0.0 = strongest correction/crop, 1.0 = keep all pixels.
+        crop_to_roi: If True, crop to valid ROI area.
 
     Returns:
         numpy.ndarray: Undistorted and cropped image
@@ -484,8 +520,9 @@ def undistort_image(image, npz_path):
     with np.load(npz_path) as params:
         mtx = params["mtx"]
         dist = params["dist"]
-        roi = params["roi"]
-        newcameramtx = params.get("newcameramtx", None)
+        calibration_size = (
+            tuple(params["image_size"]) if "image_size" in params else None
+        )
 
     # Load image if path provided
     if isinstance(image, str):
@@ -496,19 +533,25 @@ def undistort_image(image, npz_path):
     if img is None:
         raise ValueError(f"Could not load image")
 
-    # Get new camera matrix if not saved
-    if newcameramtx is None:
-        h, w = img.shape[:2]
-        newcameramtx, roi = cv2.getOptimalNewCameraMatrix(mtx, dist, (w, h), 1, (w, h))
+    h, w = img.shape[:2]
+    scaled_mtx = _scale_camera_matrix(mtx, calibration_size, (w, h))
+    newcameramtx, roi = cv2.getOptimalNewCameraMatrix(
+        scaled_mtx,
+        dist,
+        (w, h),
+        alpha,
+        (w, h),
+    )
 
     # Undistort
-    undistorted = cv2.undistort(img, mtx, dist, None, newcameramtx)
+    undistorted = cv2.undistort(img, scaled_mtx, dist, None, newcameramtx)
 
-    # Crop to ROI
-    x, y, w, h = roi
-    cropped = undistorted[y : y + h, x : x + w]
+    if crop_to_roi:
+        x, y, roi_w, roi_h = roi
+        if roi_w > 0 and roi_h > 0:
+            return undistorted[y : y + roi_h, x : x + roi_w]
 
-    return cropped
+    return undistorted
 
 
 def main():
@@ -560,6 +603,7 @@ def main():
     else:
         print(f"  Custom ROI:        Auto-calculated")
 
+    print(f"  Undistort alpha:   {config['CALIBRATION_UNDISTORT_ALPHA']}")
     print(f"  Test enabled:      {config['CALIBRATION_TEST_ENABLED']}")
     print("=" * 70)
 
