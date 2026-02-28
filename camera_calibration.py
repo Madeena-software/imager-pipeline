@@ -78,7 +78,13 @@ CALIBRATION_CONFIG = load_calibration_config()
 class CameraCalibrator:
     """Camera calibration class for fish-eye distortion correction."""
 
-    def __init__(self, pattern_size=(44, 35), circle_diameter=1.0):
+    CIRCLE_DIAMETER_TOLERANCE = 0.10
+
+    def __init__(
+        self,
+        pattern_size=(44, 35),
+        circle_diameter=1.0,
+    ):
         """
         Initialize the calibrator.
 
@@ -89,6 +95,175 @@ class CameraCalibrator:
         self.pattern_size = pattern_size
         self.circle_diameter = circle_diameter
         self.objp = self._create_object_points()
+        self.blob_detectors = self._create_blob_detectors()
+
+    def _try_find_grid(self, img, label):
+        """Try ordered circle-grid extraction on one image."""
+        attempts = [
+            (cv2.CALIB_CB_SYMMETRIC_GRID, "symmetric"),
+            (
+                cv2.CALIB_CB_SYMMETRIC_GRID | cv2.CALIB_CB_CLUSTERING,
+                "symmetric+cluster",
+            ),
+            (cv2.CALIB_CB_ASYMMETRIC_GRID, "asymmetric"),
+            (
+                cv2.CALIB_CB_ASYMMETRIC_GRID | cv2.CALIB_CB_CLUSTERING,
+                "asymmetric+cluster",
+            ),
+        ]
+
+        for detector, detector_name in self.blob_detectors:
+            for flags, grid_name in attempts:
+                ret, centers = cv2.findCirclesGrid(
+                    img,
+                    self.pattern_size,
+                    flags=flags,
+                    blobDetector=detector,
+                )
+                if ret:
+                    print(
+                        f"✓ Circles detected with {grid_name} grid ({label}, detector={detector_name})"
+                    )
+                    return True, centers
+
+        return False, None
+
+    def _build_blob_detector(self):
+        """Build blob detector using circle diameter with ±10% tolerance."""
+        params = cv2.SimpleBlobDetector_Params()
+        params.minThreshold = 5
+        params.maxThreshold = 255
+        params.thresholdStep = 5
+
+        effective_circle_px = (
+            self.circle_diameter
+            if self.circle_diameter and self.circle_diameter >= 6
+            else 40.0
+        )
+
+        if effective_circle_px > 0:
+            min_circle_px = effective_circle_px * (1.0 - self.CIRCLE_DIAMETER_TOLERANCE)
+            max_circle_px = effective_circle_px * (1.0 + self.CIRCLE_DIAMETER_TOLERANCE)
+            params.minArea = max(8, np.pi * (min_circle_px * 0.5) ** 2)
+            params.maxArea = max(9, np.pi * (max_circle_px * 0.5) ** 2)
+            params.maxArea = max(params.maxArea, params.minArea + 1.0)
+            params.minDistBetweenBlobs = max(2.0, effective_circle_px * 0.4)
+        else:
+            params.minArea = 8
+            params.maxArea = 5000
+
+        params.filterByArea = True
+
+        params.filterByCircularity = True
+        params.minCircularity = 0.35
+
+        params.filterByInertia = False
+
+        params.filterByConvexity = False
+
+        params.filterByColor = False
+
+        return cv2.SimpleBlobDetector_create(params)
+
+    def _create_blob_detectors(self):
+        """Create detector list."""
+        return [(self._build_blob_detector(), "circle-diameter±10%")]
+
+    def _try_detect_on_image(self, img, label):
+        """Try circle-grid detection with both symmetric and asymmetric flags."""
+        scales = [0.5, 0.75, 1.0]
+        h, w = img.shape[:2]
+        for scale in scales:
+            if scale == 1.0:
+                test_img = img
+            else:
+                new_w = max(1, int(w * scale))
+                new_h = max(1, int(h * scale))
+                test_img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+            ret, centers = self._try_find_grid(test_img, f"{label}, scale={scale:.2f}")
+            if ret:
+                if scale != 1.0:
+                    centers = centers / scale
+                return True, centers
+
+        return False, None
+
+    def _try_hough_guided_detection(self, img, label):
+        """Use Hough circles to create a synthetic clean circle image, then run findCirclesGrid."""
+        expected_d = (
+            self.circle_diameter
+            if self.circle_diameter and self.circle_diameter >= 6
+            else 40.0
+        )
+        min_d = expected_d * (1.0 - self.CIRCLE_DIAMETER_TOLERANCE)
+        max_d = expected_d * (1.0 + self.CIRCLE_DIAMETER_TOLERANCE)
+
+        scales = [0.5, 0.75, 1.0]
+        h, w = img.shape[:2]
+
+        for scale in scales:
+            if scale == 1.0:
+                test_img = img
+            else:
+                new_w = max(1, int(w * scale))
+                new_h = max(1, int(h * scale))
+                test_img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+            blur = cv2.GaussianBlur(test_img, (9, 9), 1.5)
+            min_r = max(2, int((min_d * 0.5) * scale))
+            max_r = max(min_r + 1, int((max_d * 0.5) * scale))
+            min_dist = max(8.0, min_d * scale)
+
+            circles = cv2.HoughCircles(
+                blur,
+                cv2.HOUGH_GRADIENT,
+                dp=1.2,
+                minDist=min_dist,
+                param1=120,
+                param2=12,
+                minRadius=min_r,
+                maxRadius=max_r,
+            )
+
+            if circles is None:
+                continue
+
+            circles = np.round(circles[0]).astype(np.int32)
+            expected_points = self.pattern_size[0] * self.pattern_size[1]
+            if len(circles) < int(expected_points * 0.5):
+                continue
+
+            synthetic = np.zeros_like(test_img, dtype=np.uint8)
+            for x, y, r in circles:
+                draw_r = max(2, int(max(2, r) * 0.7))
+                cv2.circle(synthetic, (x, y), draw_r, 255, -1)
+
+            synthetic = cv2.GaussianBlur(synthetic, (5, 5), 0)
+
+            ret, centers = self._try_find_grid(
+                synthetic,
+                f"hough-guided/{label}, scale={scale:.2f}, circles={len(circles)}",
+            )
+            if ret:
+                if scale != 1.0:
+                    centers = centers / scale
+                return True, centers
+
+        return False, None
+
+    def _build_preprocessed_variants(self, img):
+        """Build robust preprocessing variants for noisy circle-grid images."""
+        variants = [(img, "original")]
+
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        clahe_img = clahe.apply(img)
+        variants.append((clahe_img, "clahe"))
+
+        blur = cv2.GaussianBlur(clahe_img, (5, 5), 0)
+        variants.append((blur, "clahe+gaussian"))
+
+        return variants
 
     def _create_object_points(self):
         """Create 3D object points for the circle grid pattern."""
@@ -125,42 +300,44 @@ class CameraCalibrator:
             f"Looking for {self.pattern_size[0]}x{self.pattern_size[1]} circle grid..."
         )
 
-        # Try symmetric grid first (most common)
-        flags = cv2.CALIB_CB_SYMMETRIC_GRID
-        ret, centers = cv2.findCirclesGrid(img, self.pattern_size, flags)
-
-        if ret:
-            print("✓ Circles detected with symmetric grid")
-            return True, centers
-
-        # Try asymmetric grid
-        flags = cv2.CALIB_CB_ASYMMETRIC_GRID
-        ret, centers = cv2.findCirclesGrid(img, self.pattern_size, flags)
-
-        if ret:
-            print("✓ Circles detected with asymmetric grid")
-            return True, centers
-
-        # If failed and invert_if_needed is True, try inverted image
+        # Fixed sequence: fastest to slowest
+        # 1) Direct grid detection (normal image variants)
+        # 2) Direct grid detection (inverted variants)
+        # 3) Hough-guided grid detection (normal variants)
+        # 4) Hough-guided grid detection (inverted variants)
+        variants = self._build_preprocessed_variants(img)
+        inv_variants = []
         if invert_if_needed:
-            print("Trying inverted image...")
             img_inv = cv2.bitwise_not(img)
+            inv_variants = self._build_preprocessed_variants(img_inv)
 
-            # Try symmetric on inverted
-            ret, centers = cv2.findCirclesGrid(
-                img_inv, self.pattern_size, cv2.CALIB_CB_SYMMETRIC_GRID
-            )
+        for variant_img, label in variants:
+            ret, centers = self._try_detect_on_image(variant_img, label)
             if ret:
-                print("✓ Circles detected with symmetric grid (inverted image)")
                 return True, centers
 
-            # Try asymmetric on inverted
-            ret, centers = cv2.findCirclesGrid(
-                img_inv, self.pattern_size, cv2.CALIB_CB_ASYMMETRIC_GRID
-            )
+        if invert_if_needed:
+            print("Trying inverted image variants...")
+            for variant_img, label in inv_variants:
+                ret, centers = self._try_detect_on_image(
+                    variant_img, f"inverted/{label}"
+                )
+                if ret:
+                    return True, centers
+
+        print("Trying Hough-circle guided detection...")
+        for variant_img, label in variants:
+            ret, centers = self._try_hough_guided_detection(variant_img, label)
             if ret:
-                print("✓ Circles detected with asymmetric grid (inverted image)")
                 return True, centers
+
+        if invert_if_needed:
+            for variant_img, label in inv_variants:
+                ret, centers = self._try_hough_guided_detection(
+                    variant_img, f"inverted/{label}"
+                )
+                if ret:
+                    return True, centers
 
         print("✗ No circles detected")
         return False, None
@@ -365,6 +542,9 @@ def main():
         f"  Pattern size:      {config['CALIBRATION_PATTERN_COLS']}x{config['CALIBRATION_PATTERN_ROWS']} circles"
     )
     print(f"  Circle diameter:   {config['CALIBRATION_CIRCLE_DIAMETER']}")
+    print(
+        f"  Circle tolerance:  ±{int(CameraCalibrator.CIRCLE_DIAMETER_TOLERANCE * 100)}%"
+    )
 
     # Build custom ROI if all values are provided
     custom_roi = None
