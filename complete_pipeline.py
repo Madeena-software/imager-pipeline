@@ -19,6 +19,9 @@ def load_env_config():
         "USE_NORMALIZE": False,
         "USE_INVERT": True,
         "USE_FINAL_DENOISE": False,
+        "USE_MEDIAN_FILTER": False,
+        "MEDIAN_FILTER_RADIUS": 2,
+        "MEDIAN_FILTER_TYPE": "hybrid_imagej",  # Options: standard, bilateral, adaptive, nlm, morphological, hybrid_imagej, circular_imagej
         # Threshold method
         "THRESHOLD_METHOD": "auto",
         # Wavelet parameters
@@ -76,6 +79,7 @@ def load_env_config():
                         "USE_NORMALIZE",
                         "USE_INVERT",
                         "USE_FINAL_DENOISE",
+                        "USE_MEDIAN_FILTER",
                         "CONTRAST_NORMALIZE",
                         "CONTRAST_EQUALIZE",
                         "CONTRAST_CLASSIC_EQUALIZATION",
@@ -92,6 +96,7 @@ def load_env_config():
                         "CROP_RIGHT",
                         "CLAHE_BLOCKSIZE",
                         "CLAHE_HISTOGRAM_BINS",
+                        "MEDIAN_FILTER_RADIUS",
                         "NUM_WORKERS",
                     ]:
                         if value:
@@ -166,8 +171,10 @@ import re
 import math
 from pathlib import Path
 from scipy.signal import find_peaks
-from scipy.ndimage import gaussian_filter1d
+from scipy.ndimage import gaussian_filter1d, median_filter
 from multiprocessing import Pool, cpu_count
+import skimage.restoration
+import skimage.filters
 
 # ============================================================================
 # CONSTANTS - Bit depth values
@@ -774,6 +781,207 @@ def invert_image(image):
         return cv2.bitwise_not(image)
 
 
+def apply_advanced_median_filter(image, filter_type="hybrid_imagej", radius=2):
+    """
+    Apply advanced median filtering optimized for X-ray images.
+
+    Args:
+        image: Input image (uint16)
+        filter_type: Type of filter to apply
+            - "standard": Traditional scipy median filter (square kernel)
+            - "bilateral": Bilateral filter (preserves edges)
+            - "adaptive": Adaptive median filter (best for salt-pepper noise)
+            - "nlm": Non-local means denoising (preserves textures)
+            - "morphological": Morphological median (shape-preserving)
+            - "hybrid_imagej": ImageJ Hybrid 2D Median (BEST FOR X-RAY - edge preserving)
+            - "circular_imagej": ImageJ circular kernel median (natural shape)
+        radius: Filter radius/size
+
+    Returns:
+        Filtered image (same dtype as input)
+    """
+
+    if filter_type == "standard":
+        # Traditional scipy median filter
+        ksize = 2 * radius + 1
+        return median_filter(image, size=ksize).astype(image.dtype)
+
+    elif filter_type == "bilateral":
+        # Bilateral filter - excellent for X-ray as it preserves bone edges
+        # Convert to uint8 for OpenCV bilateral filter, then scale back
+        if image.dtype == np.uint16:
+            img_8bit = (image / MAX_16BIT * MAX_8BIT).astype(np.uint8)
+            filtered_8bit = cv2.bilateralFilter(
+                img_8bit, d=radius * 2 + 1, sigmaColor=30, sigmaSpace=30
+            )
+            return (filtered_8bit.astype(np.float32) / MAX_8BIT * MAX_16BIT).astype(
+                np.uint16
+            )
+        else:
+            return cv2.bilateralFilter(
+                image, d=radius * 2 + 1, sigmaColor=30, sigmaSpace=30
+            )
+
+    elif filter_type == "adaptive":
+        # Adaptive median filter - adjusts kernel size based on local statistics
+        # Best for salt-and-pepper noise in X-ray images
+        return _adaptive_median_filter(image, max_kernel_size=radius * 2 + 1)
+
+    elif filter_type == "nlm":
+        # Non-local means denoising - excellent for preserving textures
+        try:
+            if image.dtype == np.uint16:
+                # Convert to float for skimage, then back to uint16
+                img_float = image.astype(np.float32) / MAX_16BIT
+                filtered_float = skimage.restoration.denoise_nl_means(
+                    img_float, h=0.1, fast_mode=True, multichannel=False
+                )
+                return (filtered_float * MAX_16BIT).clip(0, MAX_16BIT).astype(np.uint16)
+            else:
+                img_float = image.astype(np.float32) / MAX_8BIT
+                filtered_float = skimage.restoration.denoise_nl_means(
+                    img_float, h=0.1, fast_mode=True, multichannel=False
+                )
+                return (filtered_float * MAX_8BIT).clip(0, MAX_8BIT).astype(np.uint8)
+        except Exception as e:
+            print(f"    Warning: NLM failed ({e}), falling back to standard median")
+            return apply_advanced_median_filter(image, "standard", radius)
+
+    elif filter_type == "morphological":
+        # Morphological median - uses disk-shaped kernel, good for preserving shapes
+        try:
+            kernel_size = radius * 2 + 1
+            kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)
+            )
+            return cv2.morphologyEx(image, cv2.MORPH_OPEN, kernel)
+        except Exception as e:
+            print(
+                f"    Warning: Morphological filter failed ({e}), falling back to standard median"
+            )
+            return apply_advanced_median_filter(image, "standard", radius)
+
+    elif filter_type == "hybrid_imagej":
+        # ImageJ Hybrid 2D Median Filter - BEST FOR X-RAY IMAGES
+        # Edge-preserving, uses Plus (+) and X (diagonal) kernels
+        try:
+            if not IMAGEJ_AVAILABLE:
+                print(
+                    f"    Warning: ImageJ not available, falling back to adaptive median"
+                )
+                return apply_advanced_median_filter(image, "adaptive", radius)
+
+            kernel_size = radius * 2 + 1
+            # Ensure odd kernel size (3, 5, or 7)
+            if kernel_size < 3:
+                kernel_size = 3
+            elif kernel_size > 7:
+                kernel_size = 7
+            elif kernel_size % 2 == 0:
+                kernel_size += 1
+
+            return ImageJReplicator.hybrid_median_filter_2d(
+                image, kernel_size=kernel_size, repetitions=1
+            )
+        except Exception as e:
+            print(
+                f"    Warning: ImageJ Hybrid filter failed ({e}), falling back to adaptive median"
+            )
+            return apply_advanced_median_filter(image, "adaptive", radius)
+
+    elif filter_type == "circular_imagej":
+        # ImageJ standard median with circular kernel - more natural than square
+        try:
+            if not IMAGEJ_AVAILABLE:
+                print(
+                    f"    Warning: ImageJ not available, falling back to standard median"
+                )
+                return apply_advanced_median_filter(image, "standard", radius)
+
+            return ImageJReplicator.median_filter_imagej(image, radius=float(radius))
+        except Exception as e:
+            print(
+                f"    Warning: ImageJ circular filter failed ({e}), falling back to standard median"
+            )
+            return apply_advanced_median_filter(image, "standard", radius)
+
+    else:
+        print(f"    Warning: Unknown filter type '{filter_type}', using hybrid ImageJ")
+        return apply_advanced_median_filter(image, "hybrid_imagej", radius)
+
+
+def _adaptive_median_filter(image, max_kernel_size=7):
+    """
+    Adaptive median filter implementation.
+    Adjusts kernel size based on local image statistics.
+    Excellent for removing salt-and-pepper noise while preserving edges.
+    """
+    filtered = np.copy(image)
+    height, width = image.shape
+
+    for i in range(1, height - 1):
+        for j in range(1, width - 1):
+            # Start with 3x3 kernel
+            kernel_size = 3
+
+            while kernel_size <= max_kernel_size:
+                half_size = kernel_size // 2
+
+                # Extract local window
+                i_start = max(0, i - half_size)
+                i_end = min(height, i + half_size + 1)
+                j_start = max(0, j - half_size)
+                j_end = min(width, j + half_size + 1)
+
+                window = image[i_start:i_end, j_start:j_end]
+
+                # Calculate median, min, max
+                med_val = np.median(window)
+                min_val = np.min(window)
+                max_val = np.max(window)
+                current_val = image[i, j]
+
+                # Stage A: Check if median is noise
+                if min_val < med_val < max_val:
+                    # Median is not noise, go to Stage B
+                    if min_val < current_val < max_val:
+                        # Current pixel is not noise, keep it
+                        filtered[i, j] = current_val
+                    else:
+                        # Current pixel is noise, replace with median
+                        filtered[i, j] = med_val
+                    break
+                else:
+                    # Median is noise, increase kernel size
+                    kernel_size += 2
+
+            # If we've reached max kernel size and still noise, use median anyway
+            if kernel_size > max_kernel_size:
+                half_size = max_kernel_size // 2
+                i_start = max(0, i - half_size)
+                i_end = min(height, i + half_size + 1)
+                j_start = max(0, j - half_size)
+                j_end = min(width, j + half_size + 1)
+                window = image[i_start:i_end, j_start:j_end]
+                filtered[i, j] = np.median(window)
+
+    return filtered.astype(image.dtype)
+
+
+def _get_filter_description(filter_type):
+    """Get description of filter type for informational output."""
+    descriptions = {
+        "standard": "Traditional scipy median filter (square kernel)",
+        "bilateral": "Edge-preserving bilateral filter (good for bone details)",
+        "adaptive": "Adaptive median filter (best for salt-pepper noise)",
+        "nlm": "Non-local means denoising (preserves textures)",
+        "morphological": "Morphological median (shape-preserving)",
+        "hybrid_imagej": "ImageJ Hybrid 2D Median (BEST FOR X-RAY - edge preserving)",
+        "circular_imagej": "ImageJ circular kernel median (natural shape preservation)",
+    }
+    return descriptions.get(filter_type, "Unknown filter type")
+
+
 def process_single_image(
     raw_path, dark_path, flat_path, output_path, detector_type=None
 ):
@@ -1088,6 +1296,36 @@ def process_single_image(
     else:
         print("  [10/10] Final denoise skipped (USE_FINAL_DENOISE=False)")
 
+    # Step 11: Advanced Median filter (optional, reduces salt-and-pepper noise)
+    if CONFIG.get("USE_MEDIAN_FILTER", False):
+        radius = CONFIG.get("MEDIAN_FILTER_RADIUS", 2)
+        filter_type = CONFIG.get("MEDIAN_FILTER_TYPE", "adaptive")
+        print(
+            f"  [11/11] Advanced median filter (type={filter_type}, radius={radius})..."
+        )
+
+        # Apply advanced median filtering
+        final_result_uint16 = apply_advanced_median_filter(
+            final_result_uint16, filter_type=filter_type, radius=radius
+        )
+
+        print(
+            f"    Filtered range: {final_result_uint16.min()} - {final_result_uint16.max()}"
+        )
+        print(
+            f"    Filter type: {filter_type.title()} - {_get_filter_description(filter_type)}"
+        )
+
+        save_histogram(
+            final_result_uint16,
+            os.path.join(
+                debug_dir, f"histogram_median_filter_{filter_type}_{image_id}.png"
+            ),
+            title=f"{filter_type.title()} Median Filter Result Histogram",
+        )
+    else:
+        print("  [11/11] Median filter skipped (USE_MEDIAN_FILTER=False)")
+
     # Save result
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     cv2.imwrite(output_path, final_result_uint16)
@@ -1206,17 +1444,27 @@ def main():
     print("=" * 70)
     print("\nProcessing steps:")
     print("  1. Crop & Rotate by detector type:")
-    print("      - TRX: crop 200px each side, rotate 90° CCW")
-    print("      - BED: crop 200px each side")
-    print("  2. Denoise (wavelet: sym4, level=3, BayesShrink, soft)")
+    print("      - TRX: crop configurable pixels each side, rotate 90° CCW")
+    print("      - BED: crop configurable pixels each side")
+    print("  2. Denoise (wavelet: configurable type, level, method, mode)")
     print("  3. Flat-Field Correction (FFC) with GPU acceleration")
     print("  4. Auto Thresholding (background separation)")
     print("  5. Invert")
-    print("  6. Enhance Contrast (ImageJ method: saturated=0.35%, normalize=True)")
-    print("  7. CLAHE (ImageJ method: block_size=127, max_slope=1.5)")
+    print("  6. Enhance Contrast (ImageJ method: configurable saturated pixels)")
+    print("  7. CLAHE (ImageJ method: configurable parameters)")
+    print("  8. Advanced Median Filter (7 types: ImageJ Hybrid is BEST for X-ray)")
+    print("\nAdvanced Median Filter Types:")
+    print("  - hybrid_imagej: ImageJ Hybrid 2D (BEST FOR X-RAY - edge preserving)")
+    print("  - circular_imagej: ImageJ circular kernel (natural shape preservation)")
+    print("  - bilateral: Edge-preserving filter (good for bone details)")
+    print("  - adaptive: Adaptive median (best for salt-pepper noise)")
+    print("  - nlm: Non-local means (preserves textures)")
+    print("  - morphological: Shape-preserving morphological median")
+    print("  - standard: Traditional scipy median (square kernel)")
     print("\nOptimizations:")
     print("  - GPU acceleration for FFC and array operations (CuPy)")
     print("  - Parallel batch processing (multiprocessing)")
+    print("  - Configurable via .env file")
     print("=" * 70)
 
     # Example 1: Single image processing
@@ -1253,6 +1501,10 @@ def main():
     print("  1. For single image: Call process_single_image()")
     print("  2. For batch: Call batch_process_parallel()")
     print("  3. Uncomment examples in main() and modify paths")
+    print("\nRecommended .env settings for X-ray:")
+    print("  USE_MEDIAN_FILTER=True")
+    print("  MEDIAN_FILTER_TYPE=hybrid_imagej")
+    print("  MEDIAN_FILTER_RADIUS=2")
 
 
 if __name__ == "__main__":
